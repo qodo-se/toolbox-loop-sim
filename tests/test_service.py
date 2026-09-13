@@ -70,6 +70,46 @@ def test_login_accepts_and_upgrades_legacy_hash():
     assert stored.startswith(service.HASH_PREFIX + "$")
     assert service.login(c, 1, "s3cret") is True
 
+def test_login_rejects_malformed_stored_hashes():
+    c = setup_db()
+    for bad in (12345, b"bytes", "pbkdf2_sha256$notanint$aa$bb", "pbkdf2_sha256$200000$zz$bb",
+                "pbkdf2_sha256$" + str(10 ** 400) + "$aa$bb", "pbkdf2_sha256$0$aa$bb", "é"):
+        c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (bad,))
+        assert service.login(c, 1, "s3cret") is False
+
+def test_legacy_upgrade_does_not_clobber_concurrent_reset():
+    c = setup_db()
+    legacy = hashlib.sha256("s3cret".encode()).hexdigest()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (legacy,))
+    reset = service.hash_password("brand-new")
+    real_hash_password = service.hash_password
+
+    def reset_lands_first(pw, *args, **kwargs):
+        # Fires inside login's read/write window, standing in for a concurrent reset.
+        c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (reset,))
+        return real_hash_password(pw, *args, **kwargs)
+
+    service.hash_password = reset_lands_first
+    try:
+        service.login(c, 1, "s3cret")
+    finally:
+        service.hash_password = real_hash_password
+    assert c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0] == reset
+    assert service.login(c, 1, "brand-new") is True
+
+def test_check_amount_rejects_huge_int_without_overflow():
+    c = setup_db()
+    order_id = service.create_order(c, 1, 9.5)
+    for huge in (10 ** 400, -(10 ** 400)):
+        for call in (lambda a: service.create_order(c, 1, a),
+                     lambda a: service.update_amount(c, order_id, a)):
+            try:
+                call(huge)
+            except ValueError:
+                continue
+            except OverflowError:
+                raise AssertionError("amount check raised OverflowError for %r" % (huge,))
+
 def test_init_schema_adds_password_hash_to_old_users_table():
     c = sqlite3.connect(":memory:")
     c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT)")

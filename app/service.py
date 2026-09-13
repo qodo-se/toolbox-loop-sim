@@ -5,6 +5,7 @@ import math
 import os
 
 PBKDF2_ITERATIONS = 200_000
+MAX_PBKDF2_ITERATIONS = 10_000_000
 SALT_BYTES = 16
 HASH_PREFIX = "pbkdf2_sha256"
 
@@ -39,15 +40,19 @@ def hash_password(pw: str, salt: bytes = None, iterations: int = PBKDF2_ITERATIO
 
 def verify_password(pw: str, stored: str) -> bool:
     """Check pw against a stored record, accepting the legacy bare SHA-256 format."""
-    if not stored:
+    # A corrupted or unexpectedly typed record must fail the check, not raise.
+    if not stored or not isinstance(stored, str) or not stored.isascii():
         return False
     parts = stored.split("$")
     if len(parts) == 4 and parts[0] == HASH_PREFIX:
         try:
+            iterations = int(parts[1])
+            if not 1 <= iterations <= MAX_PBKDF2_ITERATIONS:
+                return False
             candidate = hashlib.pbkdf2_hmac(
-                'sha256', pw.encode(), bytes.fromhex(parts[2]), int(parts[1])
+                'sha256', pw.encode(), bytes.fromhex(parts[2]), iterations
             ).hex()
-        except ValueError:
+        except (ValueError, OverflowError):
             return False
         return hmac.compare_digest(candidate, parts[3])
     # Records written before PBKDF2 held a bare SHA-256 hexdigest.
@@ -65,7 +70,12 @@ def _dummy_hash():
 def _check_amount(amount):
     if isinstance(amount, bool) or not isinstance(amount, (int, float)):
         raise ValueError("amount must be a number")
-    if not math.isfinite(amount):
+    try:
+        as_float = float(amount)
+    except OverflowError:
+        # An int too large for a float is not a storable total; keep the ValueError contract.
+        raise ValueError("amount is out of range")
+    if not math.isfinite(as_float):
         raise ValueError("amount must be finite")
     if amount <= 0:
         raise ValueError("amount must be positive")
@@ -114,6 +124,11 @@ def login(conn, user_id, pw):
         return False
     if not stored.startswith(HASH_PREFIX + "$"):
         # The password checked out against a legacy record, so re-store it salted.
-        cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(pw), user_id))
+        # Match on the hash we read so a password reset that landed in the meantime
+        # is not overwritten with the old credential.
+        cur.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (hash_password(pw), user_id, stored),
+        )
         conn.commit()
     return True

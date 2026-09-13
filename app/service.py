@@ -24,6 +24,7 @@ def create_order(conn, user_id, amount):
 def find_by_email(conn, email):
     cur = conn.cursor()
     cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))
+    return cur.fetchone()
 
 
 def safe_commit(conn):

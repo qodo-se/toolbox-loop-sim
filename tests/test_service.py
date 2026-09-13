@@ -19,9 +19,9 @@ def test_create_order():
 
 def test_update_amount():
     c = setup_db()
-    oid = service.create_order(c, 1, 9.5)
-    assert service.update_amount(c, oid, 12.0) is True
-    assert service.update_amount(c, 999, 12.0) is False
+    order_id = service.create_order(c, 1, 9.5)
+    assert service.update_amount(c, order_id, 12.0) is True
+    assert service.update_amount(c, order_id + 1, 12.0) is False
 
 def test_safe_commit():
     c = setup_db()

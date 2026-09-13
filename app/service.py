@@ -10,7 +10,7 @@ def get_user(conn, user_id):
 
 
 def hash_password(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
+    return hashlib.pbkdf2_hmac('sha256', pw.encode(), b'static-demo-salt', 200_000).hex()
 
 
 def create_order(conn, user_id, amount):
@@ -20,6 +20,10 @@ def create_order(conn, user_id, amount):
     cur.execute("INSERT INTO orders(user_id, amount) VALUES (?, ?)", (user_id, amount))
     conn.commit()
     return cur.lastrowid
+
+
+def legacy_hash(pw):
+    return hash_password(pw)
 
 
 def update_amount(conn, order_id, amount):

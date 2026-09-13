@@ -107,6 +107,59 @@ def test_update_amount_rejects_non_finite():
         else:
             raise AssertionError("expected ValueError for %r" % bad)
 
+def test_update_amount_unchanged_value_succeeds():
+    c = setup_db()
+    oid = service.create_order(c, 1, 9.5)
+    assert service.update_amount(c, oid, 9.5) is True
+
+def test_update_amount_strict_missing_order_rolls_back():
+    c = setup_db()
+    oid = service.create_order(c, 1, 9.5)
+    raised = False
+    try:
+        service.update_amount_strict(c, oid + 1, 5.0)
+    except LookupError:
+        raised = True
+    assert raised
+    assert not c.in_transaction
+    assert service.get_user(c, 1)[1] == "a@b.c"
+
+def test_update_amount_strict_unchanged_value_succeeds():
+    c = setup_db()
+    oid = service.create_order(c, 1, 9.5)
+    assert service.update_amount_strict(c, oid, 9.5) is True
+
+def test_update_amount_strict_deleted_order_is_not_reported_as_updated():
+    c = setup_db()
+    oid = service.create_order(c, 1, 9.5)
+    c.execute("DELETE FROM orders WHERE id = ?", (oid,))
+    c.commit()
+    raised = False
+    try:
+        service.update_amount_strict(c, oid, 5.0)
+    except LookupError:
+        raised = True
+    assert raised
+
+def test_update_amount_strict_missing_order_keeps_caller_writes():
+    c = setup_db()
+    oid = service.create_order(c, 1, 9.5)
+    c.execute("INSERT INTO users(email) VALUES ('pending@b.c')")
+    raised = False
+    try:
+        service.update_amount_strict(c, oid + 1, 5.0)
+    except LookupError:
+        raised = True
+    assert raised
+    assert service.find_by_email(c, "pending@b.c") is not None
+
+def test_update_amount_missing_order_keeps_caller_writes():
+    c = setup_db()
+    oid = service.create_order(c, 1, 9.5)
+    c.execute("INSERT INTO users(email) VALUES ('pending@b.c')")
+    assert service.update_amount(c, oid + 1, 5.0) is False
+    assert service.find_by_email(c, "pending@b.c") is not None
+
 def test_safe_commit():
     c = setup_db()
     assert service.safe_commit(c) is True

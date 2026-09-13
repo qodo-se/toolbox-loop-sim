@@ -105,15 +105,44 @@ def find_by_email(conn, email):
     return cur.fetchone()
 
 
-def update_amount(conn, order_id, amount):
+def _apply_amount(conn, order_id, amount) -> bool:
+    """Write ``amount`` onto the order and report whether a row matched.
+
+    Shared by update_amount and update_amount_strict, which differ only in how
+    they report a missing order.
+    """
     # NaN fails every comparison, so the finite check has to come first for it
     # to be rejected at all.
     if not math.isfinite(amount) or amount <= 0:
         raise ValueError("amount must be a positive, finite number")
     cur = conn.cursor()
-    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
-    conn.commit()
-    return cur.rowcount > 0
+    # The UPDATE itself decides existence: SQLite counts a row it matched even
+    # when the value is unchanged, so rowcount == 0 means the order is gone.
+    # The savepoint keeps the undo scoped to this write, leaving any work the
+    # caller already had pending untouched.
+    cur.execute("SAVEPOINT update_amount")
+    try:
+        cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
+        matched = cur.rowcount > 0
+        if not matched:
+            cur.execute("ROLLBACK TO update_amount")
+    finally:
+        cur.execute("RELEASE update_amount")
+    if matched:
+        conn.commit()
+    return matched
+
+
+def update_amount(conn, order_id, amount):
+    """Return True when the order was updated, False when it does not exist."""
+    return _apply_amount(conn, order_id, amount)
+
+
+def update_amount_strict(conn, order_id, amount):
+    """Like update_amount, but raise LookupError when the order does not exist."""
+    if not _apply_amount(conn, order_id, amount):
+        raise LookupError("order not found")
+    return True
 
 
 def audit(conn, user_id):

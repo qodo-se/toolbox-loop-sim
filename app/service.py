@@ -4,6 +4,7 @@ import hmac
 import os
 
 PBKDF2_ITERATIONS = 600_000
+MAX_PBKDF2_ITERATIONS = 10_000_000
 
 
 def get_user(conn, user_id):
@@ -23,10 +24,16 @@ def verify_password(pw: str, stored: str) -> bool:
         algorithm, iterations, salt_hex, digest_hex = stored.split("$")
         if algorithm != "pbkdf2_sha256":
             return False
-        digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt_hex), int(iterations))
+        rounds = int(iterations)
+        if not 1 <= rounds <= MAX_PBKDF2_ITERATIONS:
+            return False
+        # Decode first so malformed (non-hex or non-ASCII) digests fail here rather than
+        # raising TypeError out of compare_digest's string mode.
+        expected = bytes.fromhex(digest_hex)
+        digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt_hex), rounds)
     except ValueError:
         return False
-    return hmac.compare_digest(digest.hex(), digest_hex)
+    return hmac.compare_digest(digest, expected)
 
 
 def create_order(conn, user_id, amount):

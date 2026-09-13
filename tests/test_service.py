@@ -15,3 +15,12 @@ def test_get_user():
 def test_create_order():
     c = setup_db()
     assert service.create_order(c, 1, 9.5) == 1
+
+def test_update_amount():
+    c = setup_db()
+    order_id = service.create_order(c, 1, 9.5)
+    assert service.update_amount(c, order_id, 12.0) is True
+
+def test_update_amount_missing_order():
+    c = setup_db()
+    assert service.update_amount(c, 999, 12.0) is False

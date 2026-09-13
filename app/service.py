@@ -6,7 +6,10 @@ import secrets
 
 PBKDF2_PREFIX = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 600_000
+# Upper bound on the work factor accepted from a stored hash, so a corrupted or
+# tampered record cannot make every login for that user run unbounded work.
 MAX_PBKDF2_ITERATIONS = 1_000_000
+SALT_BYTES = 16
 LEGACY_SHA256_LENGTH = 64
 
 
@@ -16,10 +19,18 @@ def get_user(conn, user_id):
     return cur.fetchone()
 
 
-def hash_password(pw: str) -> str:
-    salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, PBKDF2_ITERATIONS)
-    return f"{PBKDF2_PREFIX}${PBKDF2_ITERATIONS}${salt.hex()}${digest.hex()}"
+def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
+    """Return a salted digest as "pbkdf2_sha256$<iterations>$<salt_hex>$<digest_hex>".
+
+    ``salt`` and ``iterations`` default to a fresh random salt and the current
+    work factor; callers pass them explicitly only to re-derive an existing hash.
+    """
+    if salt is None:
+        salt = secrets.token_bytes(SALT_BYTES)
+    if iterations is None:
+        iterations = PBKDF2_ITERATIONS
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
+    return f"{PBKDF2_PREFIX}${iterations}${salt.hex()}${digest.hex()}"
 
 
 def legacy_hash(pw):
@@ -39,6 +50,8 @@ def is_legacy_hash(stored) -> bool:
 
 
 def verify_password(pw: str, stored: str) -> bool:
+    if not isinstance(stored, str):
+        return False
     # Hashes written before the PBKDF2 format are bare SHA-256 hex digests.
     # Accept them so existing accounts keep working; login rehashes on success.
     if is_legacy_hash(stored):
@@ -56,6 +69,8 @@ def verify_password(pw: str, stored: str) -> bool:
     # Bound the work factor so a tampered or corrupted record cannot pin a worker.
     if not 0 < iterations <= MAX_PBKDF2_ITERATIONS:
         return False
+    # Re-derive with the work factor recorded in the hash, so raising
+    # PBKDF2_ITERATIONS does not invalidate existing passwords.
     candidate = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
     return hmac.compare_digest(candidate, expected)
 

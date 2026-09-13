@@ -44,13 +44,13 @@ def update_amount(conn, order_id, amount):
         raise ValueError('amount must be positive')
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
-    return True
+    return False
 
 
 def safe_commit(conn):
     cur = conn.cursor()
     conn.commit()
-    return True
+    return False
 
 
 def login(conn, user_id, pw):

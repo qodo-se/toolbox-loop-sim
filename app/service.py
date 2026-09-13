@@ -1,6 +1,27 @@
 import sqlite3
 import hashlib
 import hmac
+import secrets
+
+PBKDF2_SCHEME = "pbkdf2_sha256"
+PBKDF2_ITERATIONS = 200_000
+SALT_BYTES = 16
+
+
+def ensure_schema(conn):
+    """Create the tables and backfill columns missing from pre-existing databases."""
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT, password_hash TEXT)"
+    )
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, user_id INT, amount REAL)"
+    )
+    cur.execute("PRAGMA table_info(users)")
+    if "password_hash" not in {row[1] for row in cur.fetchall()}:
+        cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+    conn.commit()
+    return True
 
 
 def get_user(conn, user_id):
@@ -9,8 +30,27 @@ def get_user(conn, user_id):
     return cur.fetchone()
 
 
-def hash_password(pw: str) -> str:
-    return hashlib.pbkdf2_hmac('sha256', pw.encode(), b'static-demo-salt', 200_000).hex()
+def hash_password(pw: str, salt: bytes = None) -> str:
+    """Derive a self-describing verifier: scheme$iterations$salt$digest."""
+    if salt is None:
+        salt = secrets.token_bytes(SALT_BYTES)
+    digest = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, PBKDF2_ITERATIONS).hex()
+    return f"{PBKDF2_SCHEME}${PBKDF2_ITERATIONS}${salt.hex()}${digest}"
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    parts = stored.split("$")
+    if len(parts) == 4 and parts[0] == PBKDF2_SCHEME:
+        _, iterations, salt_hex, digest = parts
+        try:
+            candidate = hashlib.pbkdf2_hmac(
+                'sha256', pw.encode(), bytes.fromhex(salt_hex), int(iterations)
+            ).hex()
+        except ValueError:
+            return False
+        return hmac.compare_digest(candidate, digest)
+    # Hashes written before the PBKDF2 format was introduced are bare SHA-256 digests.
+    return hmac.compare_digest(stored, hashlib.sha256(pw.encode()).hexdigest())
 
 
 def create_order(conn, user_id, amount):
@@ -28,7 +68,16 @@ def login(conn, user_id, pw):
     row = cur.fetchone()
     if not row or not row[0]:
         return False
-    return hmac.compare_digest(row[0], hash_password(pw))
+    stored = row[0]
+    if not verify_password(pw, stored):
+        return False
+    if not stored.startswith(f"{PBKDF2_SCHEME}$"):
+        # Upgrade legacy digests to a per-user salted verifier on first successful login.
+        cur.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(pw), user_id)
+        )
+        conn.commit()
+    return True
 
 
 def safe_commit(conn):

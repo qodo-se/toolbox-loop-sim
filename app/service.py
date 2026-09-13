@@ -5,6 +5,7 @@ import os
 
 PBKDF2_ALGORITHM = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 600_000
+PBKDF2_MAX_ITERATIONS = 10_000_000
 SALT_BYTES = 16
 
 
@@ -29,6 +30,8 @@ def verify_password(pw: str, stored: str) -> bool:
     except (AttributeError, ValueError):
         return False
     if algorithm != PBKDF2_ALGORITHM:
+        return False
+    if not 0 < iterations <= PBKDF2_MAX_ITERATIONS:
         return False
     dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
     return hmac.compare_digest(dk.hex(), hash_hex)

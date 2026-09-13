@@ -39,6 +39,12 @@ def test_login_rejects_malformed_password_hash():
     c.execute("INSERT INTO users(email, password_hash) VALUES ('bad@pw.c', 'deadbeef')")
     assert service.login(c, 2, "s3cret") is False
 
+def test_verify_password_rejects_out_of_range_iterations():
+    salt = "00" * service.SALT_BYTES
+    for iterations in ("0", "-1", str(service.PBKDF2_MAX_ITERATIONS + 1)):
+        stored = f"{service.PBKDF2_ALGORITHM}${iterations}${salt}$deadbeef"
+        assert service.verify_password("s3cret", stored) is False
+
 def test_login_rejects_user_without_password_hash():
     c = setup_db()
     c.execute("INSERT INTO users(email) VALUES ('no@pw.c')")

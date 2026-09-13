@@ -1,6 +1,14 @@
+import hashlib
 import sqlite3
 import pytest
 from app import service
+
+# Credential formats written by releases before the self-describing record.
+LEGACY_MD5 = hashlib.md5(b"hunter2").hexdigest()
+LEGACY_SHA256 = hashlib.sha256(b"hunter2").hexdigest()
+LEGACY_STATIC_PBKDF2 = hashlib.pbkdf2_hmac(
+    "sha256", b"hunter2", service.LEGACY_STATIC_SALT, service.PBKDF2_ITERATIONS
+).hex()
 
 def setup_db():
     c = sqlite3.connect(":memory:")
@@ -11,6 +19,17 @@ def setup_db():
         (service.hash_password("hunter2"),),
     )
     return c
+
+def add_user(conn, email, password_hash):
+    cur = conn.execute(
+        "INSERT INTO users(email, password_hash) VALUES (?, ?)", (email, password_hash)
+    )
+    return cur.lastrowid
+
+def stored_hash(conn, user_id):
+    return conn.execute(
+        "SELECT password_hash FROM users WHERE id = ?", (user_id,)
+    ).fetchone()[0]
 
 def test_get_user():
     c = setup_db()
@@ -24,6 +43,17 @@ def test_create_order_rejects_nan():
     c = setup_db()
     with pytest.raises(ValueError):
         service.create_order(c, 1, float('nan'))
+
+def test_check_amount_rejects_non_numeric_and_bools():
+    for bad in (None, "5", True, False, [1], object()):
+        with pytest.raises(ValueError):
+            service.check_amount(bad)
+
+def test_create_order_rejects_bool_amount():
+    c = setup_db()
+    with pytest.raises(ValueError):
+        service.create_order(c, 1, True)
+    assert c.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
 
 def test_update_amount():
     c = setup_db()
@@ -53,6 +83,22 @@ def test_verify_password():
     assert not service.verify_password("wrong", record)
     assert not service.verify_password("hunter2", "not-a-record")
 
+def test_verify_password_rejects_out_of_range_iterations():
+    record = service.hash_password("hunter2")
+    _, _, salt, digest = record.split('$')
+    for iterations in (0, -1, service.MAX_PBKDF2_ITERATIONS + 1):
+        bad = f"pbkdf2_sha256${iterations}${salt}${digest}"
+        assert not service.verify_password("hunter2", bad)
+
+def test_verify_password_rejects_malformed_records():
+    for bad in ("not-a-record", "", "$$$", "z" * 64, "pbkdf2_sha256$x$aa$bb", None, 7):
+        assert not service.verify_password("hunter2", bad)
+
+def test_verify_password_accepts_legacy_records():
+    for record in (LEGACY_MD5, LEGACY_SHA256, LEGACY_STATIC_PBKDF2):
+        assert service.verify_password("hunter2", record)
+        assert not service.verify_password("wrong", record)
+
 def test_legacy_hash_matches_hash_password_rules():
     assert service.verify_password("hunter2", service.legacy_hash("hunter2"))
 
@@ -61,6 +107,30 @@ def test_login():
     assert service.login(c, 1, "hunter2")
     assert not service.login(c, 1, "wrong")
     assert not service.login(c, 999, "hunter2")
+
+def test_login_accepts_and_upgrades_legacy_hashes():
+    c = setup_db()
+    for i, record in enumerate((LEGACY_MD5, LEGACY_SHA256, LEGACY_STATIC_PBKDF2)):
+        uid = add_user(c, f"legacy{i}@b.c", record)
+        assert service.login(c, uid, "hunter2")
+        upgraded = stored_hash(c, uid)
+        assert upgraded.startswith("pbkdf2_sha256$")
+        assert service.verify_password("hunter2", upgraded)
+        # The upgraded credential keeps working on later sign-ins.
+        assert service.login(c, uid, "hunter2")
+        assert not service.login(c, uid, "wrong")
+
+def test_login_leaves_legacy_hash_alone_on_bad_password():
+    c = setup_db()
+    uid = add_user(c, "legacy@b.c", LEGACY_SHA256)
+    assert not service.login(c, uid, "wrong")
+    assert stored_hash(c, uid) == LEGACY_SHA256
+
+def test_login_does_not_rehash_current_format():
+    c = setup_db()
+    before = stored_hash(c, 1)
+    assert service.login(c, 1, "hunter2")
+    assert stored_hash(c, 1) == before
 
 def test_safe_commit():
     c = setup_db()

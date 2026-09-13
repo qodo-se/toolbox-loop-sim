@@ -13,23 +13,35 @@ def get_user(conn, user_id):
     return cur.fetchone()
 
 
-def hash_password(pw: str, salt: bytes = None) -> str:
-    """Return a salted PBKDF2-SHA256 digest as "<salt_hex>$<digest_hex>"."""
+def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
+    """Return a salted PBKDF2-SHA256 digest as "<iterations>$<salt_hex>$<digest_hex>"."""
     if salt is None:
         salt = secrets.token_bytes(SALT_BYTES)
-    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, PBKDF2_ITERATIONS)
-    return f"{salt.hex()}${digest.hex()}"
+    if iterations is None:
+        iterations = PBKDF2_ITERATIONS
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
+    return f"{iterations}${salt.hex()}${digest.hex()}"
 
 
 def verify_password(pw: str, stored: str) -> bool:
-    salt_hex, sep, digest_hex = (stored or "").partition("$")
-    if not sep or not digest_hex:
+    if not isinstance(stored, str):
+        return False
+    parts = stored.split("$")
+    if len(parts) != 3:
+        return False
+    iterations_str, salt_hex, digest_hex = parts
+    if not digest_hex:
         return False
     try:
+        iterations = int(iterations_str)
         salt = bytes.fromhex(salt_hex)
     except ValueError:
         return False
-    return hmac.compare_digest(hash_password(pw, salt), stored)
+    if iterations <= 0:
+        return False
+    # Re-derive with the work factor recorded in the hash, so raising
+    # PBKDF2_ITERATIONS does not invalidate existing passwords.
+    return hmac.compare_digest(hash_password(pw, salt, iterations), stored)
 
 
 def create_order(conn, user_id, amount):

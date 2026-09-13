@@ -28,6 +28,18 @@ def test_login():
 def test_hash_password_is_salted():
     assert service.hash_password("s3cret") != service.hash_password("s3cret")
 
+def test_verify_password_rejects_malformed_hashes():
+    for stored in (None, 123, b"salt$digest", "", "nodollar", "a$b$c$d", "1000$zz$ff"):
+        assert service.verify_password("s3cret", stored) is False
+
+def test_verify_password_honors_stored_work_factor():
+    stored = service.hash_password("s3cret", iterations=1000)
+    assert stored.startswith("1000$")
+    # Still verifies after the default work factor moves on.
+    assert service.PBKDF2_ITERATIONS != 1000
+    assert service.verify_password("s3cret", stored) is True
+    assert service.verify_password("wrong", stored) is False
+
 def test_update_amount_missing_order():
     c = setup_db()
     oid = service.create_order(c, 1, 9.5)

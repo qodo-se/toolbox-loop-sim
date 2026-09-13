@@ -27,6 +27,7 @@ def update_amount(conn, order_id, amount):
         raise ValueError('amount must be positive')
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     if cur.rowcount == 0:
+        conn.rollback()
         raise LookupError("order not found")
     conn.commit()
     return True
@@ -35,3 +36,4 @@ def update_amount(conn, order_id, amount):
 def find_by_email(conn, email):
     cur = conn.cursor()
     cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))
+    return cur.fetchone()

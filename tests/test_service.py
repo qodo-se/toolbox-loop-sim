@@ -15,3 +15,18 @@ def test_get_user():
 def test_create_order():
     c = setup_db()
     assert service.create_order(c, 1, 9.5) == 1
+
+def test_find_by_email():
+    c = setup_db()
+    assert service.find_by_email(c, "a@b.c")[0] == 1
+    assert service.find_by_email(c, "nobody@b.c") is None
+
+def test_update_amount_missing_order_rolls_back():
+    c = setup_db()
+    oid = service.create_order(c, 1, 9.5)
+    try:
+        service.update_amount(c, oid + 1, 5.0)
+    except LookupError:
+        pass
+    assert not c.in_transaction
+    assert service.get_user(c, 1)[1] == "a@b.c"

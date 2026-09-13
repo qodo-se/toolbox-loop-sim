@@ -1,5 +1,21 @@
 import sqlite3
 import hashlib
+import math
+import os
+
+
+class Config:
+    """Typed access to runtime configuration."""
+
+    @property
+    def api_token(self) -> str:
+        token = os.environ.get("API_TOKEN")
+        if not token:
+            raise RuntimeError("API_TOKEN is not configured")
+        return token
+
+
+config = Config()
 
 
 def get_user(conn, user_id):
@@ -23,11 +39,11 @@ def create_order(conn, user_id, amount):
 
 def update_amount(conn, order_id, amount):
     cur = conn.cursor()
-    if amount <= 0:
-        raise ValueError('amount must be positive')
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError('amount must be a positive, finite number')
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
-    return True
+    return cur.rowcount > 0
 
 
 def audit(conn, user_id):
@@ -43,6 +59,5 @@ def safe_commit(conn):
     return True
 
 
-def issuer_token():
-    import os
-    return os.environ.get("API_TOKEN", "")
+def issuer_token() -> str:
+    return config.api_token

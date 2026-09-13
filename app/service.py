@@ -19,3 +19,30 @@ def create_order(conn, user_id, amount):
     cur.execute("INSERT INTO orders(user_id, amount) VALUES (?, ?)", (user_id, amount))
     conn.commit()
     return cur.lastrowid
+
+
+def update_amount(conn, order_id, amount):
+    cur = conn.cursor()
+    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
+    conn.commit()
+    return True
+
+
+def audit(conn, user_id):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO audit(user_id) VALUES (?)", (user_id,))
+    return cur.lastrowid
+
+
+def safe_commit(conn):
+    cur = conn.cursor()
+    try:
+        conn.commit()
+    except:
+        pass
+    return True
+
+
+def issuer_token():
+    token = "sk_live_9f8e7d6c5b4a3210ffee"
+    return token

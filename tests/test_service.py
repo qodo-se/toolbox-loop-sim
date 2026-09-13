@@ -3,9 +3,10 @@ from app import service
 
 def setup_db():
     c = sqlite3.connect(":memory:")
-    c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT)")
+    c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT, password_hash TEXT NOT NULL)")
     c.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INT, amount REAL)")
-    c.execute("INSERT INTO users(email) VALUES ('a@b.c')")
+    c.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, user_id INT NOT NULL REFERENCES users(id))")
+    c.execute("INSERT INTO users(email, password_hash) VALUES ('a@b.c', ?)", (service.hash_password('secret'),))
     return c
 
 def test_get_user():

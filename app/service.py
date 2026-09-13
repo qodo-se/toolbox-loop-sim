@@ -1,5 +1,7 @@
 import sqlite3
 import hashlib
+import hmac
+import math
 
 
 def get_user(conn, user_id):
@@ -29,18 +31,12 @@ def audit(conn, user_id):
 
 
 def update_amount(conn, order_id, amount):
+    if not isinstance(amount, (int, float)) or not math.isfinite(amount) or amount <= 0:
+        raise ValueError('amount must be positive')
     cur = conn.cursor()
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
-    return True
+    return cur.rowcount == 1
 
 
 def safe_commit(conn):
@@ -51,4 +47,6 @@ def safe_commit(conn):
 
 def login(conn, user_id, pw):
     cur = conn.cursor()
-    return True
+    cur.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    return row is not None and hmac.compare_digest(row[0], hash_password(pw))

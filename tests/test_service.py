@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from app import service
 
@@ -41,3 +42,26 @@ def test_hash_password_is_salted():
 def test_verify_password_rejects_malformed_hash():
     assert service.verify_password("s3cret", "") is False
     assert service.verify_password("s3cret", "deadbeef") is False
+
+def test_verify_password_rejects_out_of_range_iterations():
+    salt_hex = "00" * 16
+    digest_hex = "11" * 32
+    for iterations in ("0", "-1", str(service.MAX_PBKDF2_ITERATIONS + 1)):
+        stored = "pbkdf2_sha256${}${}${}".format(iterations, salt_hex, digest_hex)
+        assert service.verify_password("s3cret", stored) is False
+
+def test_login_accepts_legacy_sha256_hash():
+    c = setup_db()
+    legacy = hashlib.sha256("s3cret".encode()).hexdigest()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (legacy,))
+    assert service.login(c, 1, "nope") is False
+    assert service.login(c, 1, "s3cret") is True
+
+def test_login_upgrades_legacy_hash():
+    c = setup_db()
+    legacy = hashlib.sha256("s3cret".encode()).hexdigest()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (legacy,))
+    assert service.login(c, 1, "s3cret") is True
+    stored = c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0]
+    assert stored.startswith("pbkdf2_sha256$")
+    assert service.login(c, 1, "s3cret") is True

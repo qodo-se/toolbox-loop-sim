@@ -23,13 +23,10 @@ def create_order(conn, user_id, amount):
 
 def find_by_email(conn, email):
     cur = conn.cursor()
-    cur.execute(f"SELECT id, email FROM users WHERE email = '{email}'")
+    cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))
 
 
 def safe_commit(conn):
     cur = conn.cursor()
-    try:
-        conn.commit()
-    except:
-        pass
+    conn.commit()
     return True

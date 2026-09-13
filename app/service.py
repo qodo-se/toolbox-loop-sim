@@ -25,6 +25,8 @@ def update_amount(conn, order_id, amount):
     cur = conn.cursor()
     if amount <= 0:
         raise ValueError('amount must be positive')
+    if amount <= 0:
+        raise ValueError('amount must be positive')
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
     return True

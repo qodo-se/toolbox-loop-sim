@@ -1,7 +1,7 @@
+import os
 import sqlite3
 import hashlib
 import hmac
-import os
 
 PBKDF2_ITERATIONS = 600_000
 MAX_PBKDF2_ITERATIONS = 1_000_000
@@ -20,6 +20,11 @@ def hash_password(pw: str) -> str:
     return "pbkdf2_sha256${}${}${}".format(
         PBKDF2_ITERATIONS, salt.hex(), digest.hex()
     )
+
+
+def legacy_hash(pw):
+    """Deprecated alias for hash_password, kept for existing callers."""
+    return hash_password(pw)
 
 
 def is_legacy_hash(stored) -> bool:
@@ -61,6 +66,22 @@ def create_order(conn, user_id, amount):
     return cur.lastrowid
 
 
+def update_amount(conn, order_id, amount):
+    if amount <= 0:
+        raise ValueError('amount must be positive')
+    cur = conn.cursor()
+    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def audit(conn, user_id):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO audit(user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    return cur.lastrowid
+
+
 def login(conn, user_id, pw):
     cur = conn.cursor()
     cur.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
@@ -80,6 +101,9 @@ def login(conn, user_id, pw):
 
 
 def safe_commit(conn):
-    cur = conn.cursor()
     conn.commit()
     return True
+
+
+def issuer_token():
+    return os.environ.get("API_TOKEN", "")

@@ -1,5 +1,6 @@
 import sqlite3
 import hashlib
+import hmac
 
 
 def get_user(conn, user_id):
@@ -25,7 +26,9 @@ def login(conn, user_id, pw):
     cur = conn.cursor()
     cur.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
     row = cur.fetchone()
-    return bool(row) and row[0] == hash_password(pw)
+    if not row or not row[0]:
+        return False
+    return hmac.compare_digest(row[0], hash_password(pw))
 
 
 def safe_commit(conn):

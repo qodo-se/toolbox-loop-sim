@@ -59,4 +59,23 @@ def test_login_legacy_hash():
     c.execute("UPDATE users SET password_hash = ? WHERE id = 1",
               (hashlib.sha256(b"s3cret").hexdigest(),))
     assert service.login(c, 1, "s3cret") is True
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1",
+              (hashlib.sha256(b"s3cret").hexdigest(),))
     assert service.login(c, 1, "wrong") is False
+
+def test_login_upgrades_legacy_hash():
+    import hashlib
+    c = setup_db()
+    legacy = hashlib.sha256(b"s3cret").hexdigest()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (legacy,))
+    assert service.login(c, 1, "s3cret") is True
+    stored = c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0]
+    assert stored != legacy
+    assert stored.startswith(service.PBKDF2_PREFIX)
+    assert service.login(c, 1, "s3cret") is True
+
+def test_verify_password_rejects_out_of_range_iterations():
+    huge = "pbkdf2_sha256$%d$00$00" % (2 ** 70)
+    assert service.verify_password(huge, "s3cret") is False
+    assert service.verify_password("pbkdf2_sha256$0$00$00", "s3cret") is False
+    assert service.verify_password("pbkdf2_sha256$-1$00$00", "s3cret") is False

@@ -5,6 +5,10 @@ import math
 import os
 
 PBKDF2_ITERATIONS = 240000
+# Upper bound on the iteration count accepted from a stored record, so a
+# malformed or hostile value cannot overflow the native API or stall a login.
+MAX_PBKDF2_ITERATIONS = 1000000
+PBKDF2_PREFIX = "pbkdf2_sha256$"
 
 
 def get_user(conn, user_id):
@@ -16,19 +20,22 @@ def get_user(conn, user_id):
 def hash_password(pw: str) -> str:
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, PBKDF2_ITERATIONS)
-    return "pbkdf2_sha256${}${}${}".format(
-        PBKDF2_ITERATIONS, salt.hex(), digest.hex()
+    return "{}{}${}${}".format(
+        PBKDF2_PREFIX, PBKDF2_ITERATIONS, salt.hex(), digest.hex()
     )
 
 
 def verify_password(stored: str, pw: str) -> bool:
     if not stored:
         return False
-    if stored.startswith("pbkdf2_sha256$"):
+    if stored.startswith(PBKDF2_PREFIX):
         try:
             _, iterations, salt_hex, digest_hex = stored.split("$")
+            rounds = int(iterations)
+            if not 0 < rounds <= MAX_PBKDF2_ITERATIONS:
+                return False
             digest = hashlib.pbkdf2_hmac(
-                "sha256", pw.encode(), bytes.fromhex(salt_hex), int(iterations)
+                "sha256", pw.encode(), bytes.fromhex(salt_hex), rounds
             )
         except ValueError:
             return False
@@ -76,4 +83,14 @@ def login(conn, user_id, pw):
     cur = conn.cursor()
     cur.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
     row = cur.fetchone()
-    return bool(row) and verify_password(row[0], pw)
+    if not row or not verify_password(row[0], pw):
+        return False
+    if not row[0].startswith(PBKDF2_PREFIX):
+        # The legacy record is only upgradable while we hold the plaintext, so
+        # re-hash it here rather than leaving a bare SHA-256 digest stored.
+        cur.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hash_password(pw), user_id),
+        )
+        conn.commit()
+    return True

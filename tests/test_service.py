@@ -33,15 +33,18 @@ def test_update_amount_rejects_non_finite():
             raise AssertionError("expected ValueError for %r" % bad)
 
 def test_issuer_token_requires_config():
-    os.environ.pop("API_TOKEN", None)
+    original = os.environ.pop("API_TOKEN", None)
     try:
-        service.issuer_token()
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError("expected RuntimeError when API_TOKEN is unset")
-    os.environ["API_TOKEN"] = "t"
-    try:
+        try:
+            service.issuer_token()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected RuntimeError when API_TOKEN is unset")
+        os.environ["API_TOKEN"] = "t"
         assert service.issuer_token() == "t"
     finally:
-        os.environ.pop("API_TOKEN", None)
+        if original is None:
+            os.environ.pop("API_TOKEN", None)
+        else:
+            os.environ["API_TOKEN"] = original

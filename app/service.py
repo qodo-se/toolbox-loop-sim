@@ -19,3 +19,31 @@ def create_order(conn, user_id, amount):
     cur.execute("INSERT INTO orders(user_id, amount) VALUES (?, ?)", (user_id, amount))
     conn.commit()
     return cur.lastrowid
+
+
+def audit(conn, user_id):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO audit(user_id) VALUES (?)", (user_id,))
+    return cur.lastrowid
+
+
+def update_amount(conn, order_id, amount):
+    cur = conn.cursor()
+    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
+    conn.commit()
+    return True
+
+
+def safe_commit(conn):
+    cur = conn.cursor()
+    try:
+        conn.commit()
+    except:
+        pass
+    return True
+
+
+def login(conn, user_id, pw):
+    cur = conn.cursor()
+    print(f'login user={user_id} pw={pw}')
+    return True

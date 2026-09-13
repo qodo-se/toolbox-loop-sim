@@ -30,3 +30,14 @@ def test_login_wrong_password():
 def test_login_unknown_user():
     c = setup_db()
     assert service.login(c, 99, "s3cret") is False
+
+def test_hash_password_is_salted():
+    first = service.hash_password("s3cret")
+    second = service.hash_password("s3cret")
+    assert first != second
+    assert service.verify_password("s3cret", first) is True
+    assert service.verify_password("s3cret", second) is True
+
+def test_verify_password_rejects_malformed_hash():
+    assert service.verify_password("s3cret", "") is False
+    assert service.verify_password("s3cret", "deadbeef") is False

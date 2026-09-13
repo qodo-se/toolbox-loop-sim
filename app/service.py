@@ -1,6 +1,11 @@
 import sqlite3
 import hashlib
 import hmac
+import os
+
+PBKDF2_ALGORITHM = "pbkdf2_sha256"
+PBKDF2_ITERATIONS = 600_000
+SALT_BYTES = 16
 
 
 def get_user(conn, user_id):
@@ -9,8 +14,24 @@ def get_user(conn, user_id):
     return cur.fetchone()
 
 
-def hash_password(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
+def hash_password(pw: str, salt: bytes = None) -> str:
+    if salt is None:
+        salt = os.urandom(SALT_BYTES)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, PBKDF2_ITERATIONS)
+    return f"{PBKDF2_ALGORITHM}${PBKDF2_ITERATIONS}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    try:
+        algorithm, iterations, salt_hex, hash_hex = stored.split("$")
+        salt = bytes.fromhex(salt_hex)
+        iterations = int(iterations)
+    except (AttributeError, ValueError):
+        return False
+    if algorithm != PBKDF2_ALGORITHM:
+        return False
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
+    return hmac.compare_digest(dk.hex(), hash_hex)
 
 
 def create_order(conn, user_id, amount):
@@ -34,7 +55,7 @@ def login(conn, user_id, pw):
     row = cur.fetchone()
     if row is None or row[0] is None:
         return False
-    return hmac.compare_digest(row[0], hash_password(pw))
+    return verify_password(pw, row[0])
 
 
 def safe_commit(conn):

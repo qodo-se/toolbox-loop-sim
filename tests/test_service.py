@@ -1,13 +1,15 @@
 import os
 import sqlite3
+import tempfile
 from app import service
 
-def setup_db():
-    c = sqlite3.connect(":memory:")
+def setup_db(path=":memory:"):
+    c = sqlite3.connect(path)
     c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT)")
     c.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INT, amount REAL)")
     c.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, user_id INT)")
     c.execute("INSERT INTO users(email) VALUES ('a@b.c')")
+    c.commit()
     return c
 
 def test_get_user():
@@ -34,9 +36,20 @@ def test_update_amount_rejects_non_finite():
             raise AssertionError("expected ValueError for %r" % bad)
 
 def test_audit_records_event():
-    c = setup_db()
-    assert service.audit(c, 1) == 1
-    assert c.execute("SELECT user_id FROM audit").fetchall() == [(1,)]
+    # Use an on-disk database and a second connection so the assertion only
+    # passes when the insert was actually committed.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "audit.db")
+        c = setup_db(path)
+        try:
+            assert service.audit(c, 1) == 1
+        finally:
+            c.close()
+        verify = sqlite3.connect(path)
+        try:
+            assert verify.execute("SELECT user_id FROM audit").fetchall() == [(1,)]
+        finally:
+            verify.close()
 
 def test_issuer_token_requires_config():
     original = os.environ.pop("API_TOKEN", None)

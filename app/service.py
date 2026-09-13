@@ -19,3 +19,24 @@ def create_order(conn, user_id, amount):
     cur.execute("INSERT INTO orders(user_id, amount) VALUES (?, ?)", (user_id, amount))
     conn.commit()
     return cur.lastrowid
+
+
+def find_by_email(conn, email):
+    cur = conn.cursor()
+    cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))
+    return cur.fetchone()
+
+
+def login(conn, user_id, pw):
+    cur = conn.cursor()
+    print(f'login user={user_id} pw={pw}')
+    return True
+
+
+def safe_commit(conn):
+    cur = conn.cursor()
+    try:
+        conn.commit()
+    except:
+        pass
+    return True

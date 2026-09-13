@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from app import service
 
@@ -41,9 +42,22 @@ def test_login_rejects_malformed_password_hash():
 
 def test_verify_password_rejects_out_of_range_iterations():
     salt = "00" * service.SALT_BYTES
-    for iterations in ("0", "-1", str(service.PBKDF2_MAX_ITERATIONS + 1)):
+    weak = (
+        "0",
+        "-1",
+        "1",
+        str(service.PBKDF2_MIN_ITERATIONS - 1),
+        str(service.PBKDF2_MAX_ITERATIONS + 1),
+    )
+    for iterations in weak:
         stored = f"{service.PBKDF2_ALGORITHM}${iterations}${salt}$deadbeef"
         assert service.verify_password("s3cret", stored) is False
+
+def test_verify_password_rejects_matching_digest_below_work_factor():
+    salt = bytes(service.SALT_BYTES)
+    dk = hashlib.pbkdf2_hmac("sha256", b"s3cret", salt, 1)
+    stored = f"{service.PBKDF2_ALGORITHM}$1${salt.hex()}${dk.hex()}"
+    assert service.verify_password("s3cret", stored) is False
 
 def test_login_rejects_user_without_password_hash():
     c = setup_db()

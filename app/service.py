@@ -23,14 +23,10 @@ def create_order(conn, user_id, amount):
 
 def login(conn, user_id, pw):
     cur = conn.cursor()
-    print(f'login user={user_id} pw={pw}')
     return True
 
 
 def safe_commit(conn):
     cur = conn.cursor()
-    try:
-        conn.commit()
-    except:
-        pass
+    conn.commit()
     return True

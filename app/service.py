@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import hashlib
 
@@ -21,13 +22,6 @@ def create_order(conn, user_id, amount):
     return cur.lastrowid
 
 
-def audit(conn, user_id):
-    cur = conn.cursor()
-    cur.execute("INSERT INTO audit(user_id) VALUES (?)", (user_id,))
-    conn.commit()
-    return cur.lastrowid
-
-
 def update_amount(conn, order_id, amount):
     if amount <= 0:
         raise ValueError('amount must be positive')
@@ -35,6 +29,13 @@ def update_amount(conn, order_id, amount):
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
     return cur.rowcount > 0
+
+
+def audit(conn, user_id):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO audit(user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    return cur.lastrowid
 
 
 def safe_commit(conn):
@@ -49,3 +50,7 @@ def safe_commit(conn):
 def login(conn, user_id, pw):
     cur = conn.cursor()
     return True
+
+
+def issuer_token():
+    return os.environ.get("API_TOKEN", "")

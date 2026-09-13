@@ -84,6 +84,12 @@ def create_order(conn, user_id, amount):
     return cur.lastrowid
 
 
+def find_by_email(conn, email):
+    cur = conn.cursor()
+    cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))
+    return cur.fetchone()
+
+
 def update_amount(conn, order_id, amount):
     if amount <= 0:
         raise ValueError("amount must be positive")

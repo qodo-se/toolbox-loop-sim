@@ -1,6 +1,8 @@
 import sqlite3
 import hashlib
 
+from app.config import config
+
 
 def get_user(conn, user_id):
     cur = conn.cursor()
@@ -48,5 +50,4 @@ def safe_commit(conn):
 
 
 def issuer_token():
-    import os
-    return os.environ.get("API_TOKEN", "")
+    return config.API_TOKEN

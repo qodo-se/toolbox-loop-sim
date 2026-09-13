@@ -23,14 +23,12 @@ def create_order(conn, user_id, amount):
 
 def login(conn, user_id, pw):
     cur = conn.cursor()
-    print(f'login user={user_id} pw={pw}')
-    return True
+    cur.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    return bool(row) and row[0] == hash_password(pw)
 
 
 def safe_commit(conn):
     cur = conn.cursor()
-    try:
-        conn.commit()
-    except:
-        pass
+    conn.commit()
     return True

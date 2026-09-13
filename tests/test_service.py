@@ -3,7 +3,7 @@ from app import service
 
 def setup_db():
     c = sqlite3.connect(":memory:")
-    c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT)")
+    c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT, password_hash TEXT)")
     c.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INT, amount REAL)")
     c.execute("INSERT INTO users(email) VALUES ('a@b.c')")
     return c

@@ -45,6 +45,14 @@ def test_verify_password_accepts_legacy_sha256_digest():
 def test_verify_password_rejects_malformed_verifier():
     assert not service.verify_password(PASSWORD, "pbkdf2_sha256$notanint$zz$zz")
 
+def test_verify_password_rejects_out_of_range_iteration_counts():
+    salt = b"\x00" * service.SALT_BYTES
+    digest = hashlib.pbkdf2_hmac("sha256", PASSWORD.encode(), salt, 1).hex()
+    # Oversized counts would overflow pbkdf2_hmac; zero/negative ones are nonsense.
+    for rounds in (10 ** 30, service.MAX_PBKDF2_ITERATIONS + 1, 0, -1):
+        stored = f"{service.PBKDF2_SCHEME}${rounds}${salt.hex()}${digest}"
+        assert not service.verify_password(PASSWORD, stored)
+
 def test_login_correct_password():
     c = setup_db()
     assert service.login(c, 1, PASSWORD) is True
@@ -82,3 +90,30 @@ def test_login_works_for_legacy_hash_and_upgrades_it():
     assert stored.startswith(service.PBKDF2_SCHEME + "$")
     assert service.login(c, 1, PASSWORD) is True  # still valid after the upgrade
     assert service.login(c, 1, "wrong") is False
+
+def test_legacy_upgrade_does_not_overwrite_a_concurrent_password_reset():
+    """The legacy upgrade must not resurrect the old credential."""
+    c = setup_legacy_db()
+    service.ensure_schema(c)
+    legacy = hashlib.sha256(PASSWORD.encode()).hexdigest()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (legacy,))
+
+    reset = service.hash_password("new-password")
+    original_hash_password = service.hash_password
+
+    def reset_then_hash(pw, salt=None):
+        # Stand in for a reset committing between login's SELECT and its UPDATE.
+        c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (reset,))
+        c.commit()
+        return original_hash_password(pw, salt)
+
+    service.hash_password = reset_then_hash
+    try:
+        service.login(c, 1, PASSWORD)
+    finally:
+        service.hash_password = original_hash_password
+
+    stored = c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0]
+    assert stored == reset  # the reset survives
+    assert service.login(c, 1, "new-password") is True
+    assert service.login(c, 1, PASSWORD) is False  # old password is dead

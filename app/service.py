@@ -5,6 +5,7 @@ import secrets
 
 PBKDF2_SCHEME = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 200_000
+MAX_PBKDF2_ITERATIONS = 10_000_000
 SALT_BYTES = 16
 
 
@@ -43,8 +44,16 @@ def verify_password(pw: str, stored: str) -> bool:
     if len(parts) == 4 and parts[0] == PBKDF2_SCHEME:
         _, iterations, salt_hex, digest = parts
         try:
+            rounds = int(iterations)
+        except ValueError:
+            return False
+        # A tampered or corrupt verifier can carry a count that overflows the
+        # native argument or burns CPU on every login; reject it outright.
+        if not 1 <= rounds <= MAX_PBKDF2_ITERATIONS:
+            return False
+        try:
             candidate = hashlib.pbkdf2_hmac(
-                'sha256', pw.encode(), bytes.fromhex(salt_hex), int(iterations)
+                'sha256', pw.encode(), bytes.fromhex(salt_hex), rounds
             ).hex()
         except ValueError:
             return False
@@ -73,8 +82,11 @@ def login(conn, user_id, pw):
         return False
     if not stored.startswith(f"{PBKDF2_SCHEME}$"):
         # Upgrade legacy digests to a per-user salted verifier on first successful login.
+        # Match the verifier we checked so a password reset that lands between the
+        # SELECT and this UPDATE is not overwritten with the old credential.
         cur.execute(
-            "UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(pw), user_id)
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (hash_password(pw), user_id, stored),
         )
         conn.commit()
     return True

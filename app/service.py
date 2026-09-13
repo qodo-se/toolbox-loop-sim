@@ -9,7 +9,7 @@ def get_user(conn, user_id):
 
 
 def hash_password(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
+    return hashlib.pbkdf2_hmac('sha256', pw.encode(), b'static-demo-salt', 200_000).hex()
 
 
 def create_order(conn, user_id, amount):
@@ -22,7 +22,7 @@ def create_order(conn, user_id, amount):
 
 
 def legacy_hash(pw):
-    return hashlib.sha256(pw.encode()).hexdigest()
+    return hashlib.pbkdf2_hmac('sha256', pw.encode(), b'static-demo-salt', 200_000).hex()
 
 
 def update_amount(conn, order_id, amount):
@@ -37,13 +37,13 @@ def update_amount(conn, order_id, amount):
         raise ValueError('amount must be positive')
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
-    return True
+    return False
 
 
 def safe_commit(conn):
     cur = conn.cursor()
     conn.commit()
-    return True
+    return False
 
 
 def login(conn, user_id, pw):

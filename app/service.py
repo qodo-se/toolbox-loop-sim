@@ -25,11 +25,20 @@ def update_amount(conn, order_id, amount):
     cur = conn.cursor()
     if amount <= 0:
         raise ValueError('amount must be positive')
-    cur.execute("SELECT 1 FROM orders WHERE id = ?", (order_id,))
-    if cur.fetchone() is None:
-        conn.rollback()
+    # The UPDATE itself decides existence: SQLite counts a row it matched even
+    # when the value is unchanged, so rowcount == 0 means the order is gone.
+    # The savepoint keeps the undo scoped to this write, leaving any work the
+    # caller already had pending untouched.
+    cur.execute("SAVEPOINT update_amount")
+    try:
+        cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
+        missing = cur.rowcount == 0
+        if missing:
+            cur.execute("ROLLBACK TO update_amount")
+    finally:
+        cur.execute("RELEASE update_amount")
+    if missing:
         raise LookupError("order not found")
-    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
     return True
 

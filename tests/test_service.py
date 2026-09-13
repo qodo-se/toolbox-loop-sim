@@ -37,3 +37,27 @@ def test_update_amount_unchanged_value_succeeds():
     c = setup_db()
     oid = service.create_order(c, 1, 9.5)
     assert service.update_amount(c, oid, 9.5) is True
+
+def test_update_amount_deleted_order_is_not_reported_as_updated():
+    c = setup_db()
+    oid = service.create_order(c, 1, 9.5)
+    c.execute("DELETE FROM orders WHERE id = ?", (oid,))
+    c.commit()
+    raised = False
+    try:
+        service.update_amount(c, oid, 5.0)
+    except LookupError:
+        raised = True
+    assert raised
+
+def test_update_amount_missing_order_keeps_caller_writes():
+    c = setup_db()
+    oid = service.create_order(c, 1, 9.5)
+    c.execute("INSERT INTO users(email) VALUES ('pending@b.c')")
+    raised = False
+    try:
+        service.update_amount(c, oid + 1, 5.0)
+    except LookupError:
+        raised = True
+    assert raised
+    assert service.find_by_email(c, "pending@b.c") is not None

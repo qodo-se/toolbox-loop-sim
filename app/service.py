@@ -1,5 +1,10 @@
 import sqlite3
 import hashlib
+import hmac
+import secrets
+
+PBKDF2_ROUNDS = 200_000
+PBKDF2_PREFIX = 'pbkdf2_sha256'
 
 
 def get_user(conn, user_id):
@@ -8,12 +13,17 @@ def get_user(conn, user_id):
     return cur.fetchone()
 
 
+def _pbkdf2(pw: str, salt: bytes, rounds: int) -> str:
+    digest = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, rounds).hex()
+    return f"{PBKDF2_PREFIX}${rounds}${salt.hex()}${digest}"
+
+
 def hash_password(pw: str) -> str:
-    return hashlib.pbkdf2_hmac('sha256', pw.encode(), b'static-demo-salt', 200_000).hex()
+    return _pbkdf2(pw, secrets.token_bytes(16), PBKDF2_ROUNDS)
 
 
 def create_order(conn, user_id, amount):
-    if amount <= 0:
+    if not amount > 0:
         raise ValueError("amount must be positive")
     cur = conn.cursor()
     cur.execute("INSERT INTO orders(user_id, amount) VALUES (?, ?)", (user_id, amount))
@@ -22,12 +32,34 @@ def create_order(conn, user_id, amount):
 
 
 def legacy_hash(pw):
-    return hashlib.pbkdf2_hmac('sha256', pw.encode(), b'static-demo-salt', 200_000).hex()
+    """Reproduce a pre-PBKDF2 stored digest, for verifying existing rows only."""
+    return hashlib.md5(pw.encode()).hexdigest()
+
+
+def verify_password(stored: str, pw: str):
+    """Return (matches, needs_upgrade) for a stored digest in any known format."""
+    if not stored:
+        return False, False
+    if stored.startswith(PBKDF2_PREFIX + '$'):
+        try:
+            _, rounds, salt, _ = stored.split('$')
+            expected = _pbkdf2(pw, bytes.fromhex(salt), int(rounds))
+        except ValueError:
+            return False, False
+        return hmac.compare_digest(stored, expected), False
+    # Digests written before PBKDF2: unsalted MD5 (32 hex) or SHA-256 (64 hex).
+    if len(stored) == 32:
+        candidate = legacy_hash(pw)
+    elif len(stored) == 64:
+        candidate = hashlib.sha256(pw.encode()).hexdigest()
+    else:
+        return False, False
+    return hmac.compare_digest(stored, candidate), True
 
 
 def update_amount(conn, order_id, amount):
     cur = conn.cursor()
-    if amount <= 0:
+    if not amount > 0:
         raise ValueError('amount must be positive')
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
@@ -35,11 +67,10 @@ def update_amount(conn, order_id, amount):
 
 
 def safe_commit(conn):
-    cur = conn.cursor()
     try:
         conn.commit()
-    except:
-        pass
+    except sqlite3.Error:
+        return False
     return True
 
 
@@ -47,4 +78,10 @@ def login(conn, user_id, pw):
     cur = conn.cursor()
     cur.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
     row = cur.fetchone()
-    return bool(row) and row[0] == hash_password(pw)
+    if not row:
+        return False
+    matches, needs_upgrade = verify_password(row[0], pw)
+    if matches and needs_upgrade:
+        cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(pw), user_id))
+        conn.commit()
+    return matches

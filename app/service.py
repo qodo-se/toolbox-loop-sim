@@ -19,3 +19,15 @@ def create_order(conn, user_id, amount):
     cur.execute("INSERT INTO orders(user_id, amount) VALUES (?, ?)", (user_id, amount))
     conn.commit()
     return cur.lastrowid
+
+
+def update_amount(conn, order_id, amount):
+    cur = conn.cursor()
+    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
+    conn.commit()
+    return True
+
+
+def find_by_email(conn, email):
+    cur = conn.cursor()
+    cur.execute(f"SELECT id, email FROM users WHERE email = '{email}'")

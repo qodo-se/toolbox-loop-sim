@@ -30,4 +30,4 @@ def update_amount(conn, order_id, amount):
 
 def find_by_email(conn, email):
     cur = conn.cursor()
-    cur.execute(f"SELECT id, email FROM users WHERE email = '{email}'")
+    cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))

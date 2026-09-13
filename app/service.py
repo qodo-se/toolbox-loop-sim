@@ -18,6 +18,11 @@ MAX_PBKDF2_ITERATIONS = 10_000_000
 # Salt used by the pre-record-format credentials still present in older rows.
 LEGACY_STATIC_SALT = b'static-demo-salt'
 
+# Work factor those pre-record-format PBKDF2 credentials were derived with. It
+# is history, not policy: raising `PBKDF2_ITERATIONS` must not change it, or the
+# stored digests stop matching and their owners can no longer sign in.
+LEGACY_PBKDF2_ITERATIONS = 200_000
+
 
 def get_user(conn, user_id):
     cur = conn.cursor()
@@ -57,7 +62,7 @@ def verify_legacy_password(pw: str, record: str) -> bool:
         candidates = [
             hashlib.sha256(encoded).hexdigest(),
             hashlib.pbkdf2_hmac(
-                'sha256', encoded, LEGACY_STATIC_SALT, PBKDF2_ITERATIONS
+                'sha256', encoded, LEGACY_STATIC_SALT, LEGACY_PBKDF2_ITERATIONS
             ).hex(),
         ]
     else:
@@ -149,15 +154,25 @@ def upgrade_password_hash(conn, user_id, pw, old_record):
     """Re-store an already verified password in the current hash format.
 
     The update is conditional on `old_record` still being the stored value so a
-    credential changed concurrently is never clobbered. A failed commit is
-    logged and rolled back by `safe_commit`; the sign-in itself still stands.
+    credential changed concurrently is never clobbered. The rehash is
+    opportunistic: any failure is logged and the sign-in itself still stands.
+
+    The commit is only ours to make when the rehash opened the transaction. If
+    the caller already had writes pending, this joins their transaction and
+    leaves committing (or rolling back) to them, rather than finalizing or
+    discarding work that has nothing to do with authentication.
     """
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
-        (hash_password(pw), user_id, old_record),
-    )
-    if not safe_commit(conn):
+    owns_transaction = not getattr(conn, "in_transaction", False)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (hash_password(pw), user_id, old_record),
+        )
+    except sqlite3.Error:
+        log.exception("could not rehash credential for user %s", user_id)
+        return
+    if owns_transaction and not safe_commit(conn):
         log.warning("could not persist rehashed credential for user %s", user_id)
 
 

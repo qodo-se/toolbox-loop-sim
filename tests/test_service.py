@@ -6,8 +6,10 @@ from app import service
 # Credential formats written by releases before the self-describing record.
 LEGACY_MD5 = hashlib.md5(b"hunter2").hexdigest()
 LEGACY_SHA256 = hashlib.sha256(b"hunter2").hexdigest()
+# Pinned to the literal historical work factor, not the service constant, so a
+# change to either side of the legacy contract shows up as a failure here.
 LEGACY_STATIC_PBKDF2 = hashlib.pbkdf2_hmac(
-    "sha256", b"hunter2", service.LEGACY_STATIC_SALT, service.PBKDF2_ITERATIONS
+    "sha256", b"hunter2", service.LEGACY_STATIC_SALT, 200_000
 ).hex()
 
 def setup_db():
@@ -119,6 +121,37 @@ def test_login_accepts_and_upgrades_legacy_hashes():
         # The upgraded credential keeps working on later sign-ins.
         assert service.login(c, uid, "hunter2")
         assert not service.login(c, uid, "wrong")
+
+def test_legacy_verification_survives_iteration_policy_bump(monkeypatch):
+    # Raising the policy work factor must not orphan credentials already stored
+    # under the frozen legacy one.
+    assert service.LEGACY_PBKDF2_ITERATIONS == 200_000
+    monkeypatch.setattr(service, "PBKDF2_ITERATIONS", service.PBKDF2_ITERATIONS + 50_000)
+    assert service.verify_password("hunter2", LEGACY_STATIC_PBKDF2)
+    assert not service.verify_password("wrong", LEGACY_STATIC_PBKDF2)
+
+def test_login_upgrade_does_not_commit_caller_transaction():
+    c = setup_db()
+    uid = add_user(c, "legacy@b.c", LEGACY_SHA256)
+    c.commit()
+    # A pending write the caller has not committed yet.
+    c.execute("INSERT INTO orders(user_id, amount) VALUES (1, 5.0)")
+    assert c.in_transaction
+    assert service.login(c, uid, "hunter2")
+    assert c.in_transaction
+    c.rollback()
+    assert c.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 0
+
+def test_login_upgrade_survives_failing_update():
+    c = setup_db()
+    uid = add_user(c, "legacy@b.c", LEGACY_SHA256)
+    c.commit()
+    c.execute("PRAGMA query_only = ON")
+    try:
+        assert service.login(c, uid, "hunter2")
+    finally:
+        c.execute("PRAGMA query_only = OFF")
+    assert stored_hash(c, uid) == LEGACY_SHA256
 
 def test_login_leaves_legacy_hash_alone_on_bad_password():
     c = setup_db()

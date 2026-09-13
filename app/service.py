@@ -4,6 +4,7 @@ import hmac
 import secrets
 
 PBKDF2_ROUNDS = 200_000
+PBKDF2_MAX_ROUNDS = 1_000_000
 PBKDF2_PREFIX = 'pbkdf2_sha256'
 
 
@@ -43,7 +44,11 @@ def verify_password(stored: str, pw: str):
     if stored.startswith(PBKDF2_PREFIX + '$'):
         try:
             _, rounds, salt, _ = stored.split('$')
-            expected = _pbkdf2(pw, bytes.fromhex(salt), int(rounds))
+            rounds = int(rounds)
+            # Reject a record-selected work factor before spending it.
+            if not 0 < rounds <= PBKDF2_MAX_ROUNDS:
+                return False, False
+            expected = _pbkdf2(pw, bytes.fromhex(salt), rounds)
         except ValueError:
             return False, False
         return hmac.compare_digest(stored, expected), False
@@ -82,6 +87,11 @@ def login(conn, user_id, pw):
         return False
     matches, needs_upgrade = verify_password(row[0], pw)
     if matches and needs_upgrade:
-        cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(pw), user_id))
+        # Only upgrade the digest we just verified, so a concurrent password
+        # reset is not overwritten by this old-password login.
+        cur.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (hash_password(pw), user_id, row[0]),
+        )
         conn.commit()
     return matches

@@ -48,6 +48,32 @@ def test_login_legacy_hash_upgrades():
     assert stored.startswith("pbkdf2_sha256$")
     assert service.login(c, 1, "pw") is True
 
+def test_login_upgrade_does_not_clobber_concurrent_reset():
+    c = setup_db()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (service.legacy_hash("pw"),))
+    reset = service.hash_password("new-pw")
+    real_hash_password = service.hash_password
+
+    # Land a password reset between login's read and its upgrade write.
+    def reset_then_hash(pw):
+        c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (reset,))
+        return real_hash_password(pw)
+
+    service.hash_password = reset_then_hash
+    try:
+        service.login(c, 1, "pw")
+    finally:
+        service.hash_password = real_hash_password
+    assert c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0] == reset
+    assert service.login(c, 1, "new-pw") is True
+
+def test_verify_password_rejects_excessive_rounds():
+    c = setup_db()
+    huge = f"{service.PBKDF2_PREFIX}${service.PBKDF2_MAX_ROUNDS + 1}$00$ff"
+    assert service.verify_password(huge, "pw") == (False, False)
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (huge,))
+    assert service.login(c, 1, "pw") is False
+
 def test_login_without_password_set():
     c = setup_db()
     assert service.login(c, 1, "pw") is False

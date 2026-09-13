@@ -6,10 +6,12 @@ from app import service
 # Credential formats written by releases before the self-describing record.
 LEGACY_MD5 = hashlib.md5(b"hunter2").hexdigest()
 LEGACY_SHA256 = hashlib.sha256(b"hunter2").hexdigest()
-# Pinned to the literal historical work factor, not the service constant, so a
-# change to either side of the legacy contract shows up as a failure here.
+# Pinned to the literal historical salt and work factor, not the service
+# constants, so a change to either side of the legacy contract shows up as a
+# failure here.
+LEGACY_STATIC_SALT = b"static-demo-salt"
 LEGACY_STATIC_PBKDF2 = hashlib.pbkdf2_hmac(
-    "sha256", b"hunter2", service.LEGACY_STATIC_SALT, 200_000
+    "sha256", b"hunter2", LEGACY_STATIC_SALT, 200_000
 ).hex()
 
 def setup_db():
@@ -122,6 +124,12 @@ def test_login_accepts_and_upgrades_legacy_hashes():
         assert service.login(c, uid, "hunter2")
         assert not service.login(c, uid, "wrong")
 
+def test_legacy_credential_recipe_is_frozen():
+    # These constants describe credentials already stored in the database.
+    # Editing either one orphans their owners, so pin both to the literals.
+    assert service.LEGACY_STATIC_SALT == LEGACY_STATIC_SALT
+    assert service.LEGACY_PBKDF2_ITERATIONS == 200_000
+
 def test_legacy_verification_survives_iteration_policy_bump(monkeypatch):
     # Raising the policy work factor must not orphan credentials already stored
     # under the frozen legacy one.
@@ -152,6 +160,27 @@ def test_login_upgrade_survives_failing_update():
     finally:
         c.execute("PRAGMA query_only = OFF")
     assert stored_hash(c, uid) == LEGACY_SHA256
+
+def test_upgrade_rolls_back_transaction_it_opened():
+    class FailingCursor:
+        def execute(self, *args):
+            raise sqlite3.OperationalError("database is locked")
+
+    class FailingConn:
+        in_transaction = False
+
+        def __init__(self):
+            self.rolled_back = False
+
+        def cursor(self):
+            return FailingCursor()
+
+        def rollback(self):
+            self.rolled_back = True
+
+    conn = FailingConn()
+    service.upgrade_password_hash(conn, 1, "hunter2", LEGACY_SHA256)
+    assert conn.rolled_back
 
 def test_login_leaves_legacy_hash_alone_on_bad_password():
     c = setup_db()

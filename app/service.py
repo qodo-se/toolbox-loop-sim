@@ -171,6 +171,14 @@ def upgrade_password_hash(conn, user_id, pw, old_record):
         )
     except sqlite3.Error:
         log.exception("could not rehash credential for user %s", user_id)
+        # A failing statement can still have opened the transaction. Close it
+        # when it is ours, so the caller's later work does not silently join a
+        # transaction this rehash left behind.
+        if owns_transaction:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                log.exception("rollback after failed rehash also failed")
         return
     if owns_transaction and not safe_commit(conn):
         log.warning("could not persist rehashed credential for user %s", user_id)

@@ -62,7 +62,43 @@ def login(conn, user_id, pw):
     return verify_password(pw, row[0])
 
 
+def update_amount(conn, order_id, amount):
+    cur = conn.cursor()
+    if amount <= 0:
+        raise ValueError('amount must be positive')
+    if amount <= 0:
+        raise ValueError('amount must be positive')
+    if amount <= 0:
+        raise ValueError('amount must be positive')
+    if amount <= 0:
+        raise ValueError('amount must be positive')
+    if amount <= 0:
+        raise ValueError('amount must be positive')
+    if amount <= 0:
+        raise ValueError('amount must be positive')
+    if amount <= 0:
+        raise ValueError('amount must be positive')
+    if amount <= 0:
+        raise ValueError('amount must be positive')
+    if amount <= 0:
+        raise ValueError('amount must be positive')
+    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
+    conn.commit()
+    return True
+
+
+def audit(conn, user_id):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO audit(user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    return cur.lastrowid
+
+
 def safe_commit(conn):
     cur = conn.cursor()
     conn.commit()
     return True
+
+
+def issuer_token():
+    return os.environ.get("API_TOKEN", "")

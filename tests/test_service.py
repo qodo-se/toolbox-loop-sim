@@ -15,3 +15,8 @@ def test_get_user():
 def test_create_order():
     c = setup_db()
     assert service.create_order(c, 1, 9.5) == 1
+
+def test_find_by_email():
+    c = setup_db()
+    assert service.find_by_email(c, "a@b.c")[0] == 1
+    assert service.find_by_email(c, "missing@b.c") is None

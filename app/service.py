@@ -28,7 +28,7 @@ def verify_password(pw: str, stored: str) -> bool:
             digest = hashlib.pbkdf2_hmac(
                 'sha256', pw.encode(), bytes.fromhex(salt_hex), int(iterations)
             )
-        except ValueError:
+        except (ValueError, OverflowError):
             return False
         return hmac.compare_digest(digest.hex(), digest_hex)
     # Hashes written before the PBKDF2 format are bare SHA-256 hex digests.
@@ -52,8 +52,11 @@ def login(conn, user_id, pw):
     if not row or not verify_password(pw, row[0]):
         return False
     if not row[0].startswith(PBKDF2_PREFIX + "$"):
+        # Only upgrade if the legacy hash we authenticated against is still stored,
+        # so a concurrent password reset is never overwritten with the old password.
         cur.execute(
-            "UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(pw), user_id)
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (hash_password(pw), user_id, row[0]),
         )
         conn.commit()
     return True

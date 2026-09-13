@@ -31,8 +31,9 @@ def audit(conn, user_id):
 def update_amount(conn, order_id, amount):
     cur = conn.cursor()
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
+    updated = cur.rowcount > 0
     conn.commit()
-    return True
+    return updated
 
 
 def safe_commit(conn):

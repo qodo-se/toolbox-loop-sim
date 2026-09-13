@@ -4,6 +4,9 @@ import hmac
 import secrets
 
 PBKDF2_ITERATIONS = 200_000
+# Upper bound on the work factor accepted from a stored hash, so a corrupted or
+# tampered record cannot make every login for that user run unbounded work.
+MAX_PBKDF2_ITERATIONS = 10_000_000
 SALT_BYTES = 16
 
 
@@ -37,7 +40,7 @@ def verify_password(pw: str, stored: str) -> bool:
         salt = bytes.fromhex(salt_hex)
     except ValueError:
         return False
-    if iterations <= 0:
+    if iterations <= 0 or iterations > MAX_PBKDF2_ITERATIONS:
         return False
     # Re-derive with the work factor recorded in the hash, so raising
     # PBKDF2_ITERATIONS does not invalidate existing passwords.

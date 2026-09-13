@@ -40,6 +40,11 @@ def test_verify_password_honors_stored_work_factor():
     assert service.verify_password("s3cret", stored) is True
     assert service.verify_password("wrong", stored) is False
 
+def test_verify_password_rejects_excessive_work_factor():
+    huge = service.MAX_PBKDF2_ITERATIONS + 1
+    stored = f"{huge}$00$ff"
+    assert service.verify_password("s3cret", stored) is False
+
 def test_update_amount_missing_order():
     c = setup_db()
     oid = service.create_order(c, 1, 9.5)

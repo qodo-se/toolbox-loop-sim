@@ -2,6 +2,7 @@ import os
 import sqlite3
 import hashlib
 import hmac
+import math
 import secrets
 
 PBKDF2_PREFIX = "pbkdf2_sha256"
@@ -11,6 +12,20 @@ PBKDF2_ITERATIONS = 600_000
 MAX_PBKDF2_ITERATIONS = 1_000_000
 SALT_BYTES = 16
 LEGACY_SHA256_LENGTH = 64
+
+
+class Config:
+    """Typed access to runtime configuration."""
+
+    @property
+    def api_token(self) -> str:
+        token = os.environ.get("API_TOKEN")
+        if not token:
+            raise RuntimeError("API_TOKEN is not configured")
+        return token
+
+
+config = Config()
 
 
 def get_user(conn, user_id):
@@ -91,8 +106,10 @@ def find_by_email(conn, email):
 
 
 def update_amount(conn, order_id, amount):
-    if amount <= 0:
-        raise ValueError("amount must be positive")
+    # NaN fails every comparison, so the finite check has to come first for it
+    # to be rejected at all.
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError("amount must be a positive, finite number")
     cur = conn.cursor()
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
@@ -131,8 +148,8 @@ def safe_commit(conn):
     return True
 
 
-def issuer_token():
-    return os.environ.get("API_TOKEN", "")
+def issuer_token() -> str:
+    return config.api_token
 
 
 MAX_EXPR_DEPTH = 50

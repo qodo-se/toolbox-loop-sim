@@ -31,15 +31,13 @@ def update_amount(conn, order_id, amount):
 def audit(conn, user_id):
     cur = conn.cursor()
     cur.execute("INSERT INTO audit(user_id) VALUES (?)", (user_id,))
+    conn.commit()
     return cur.lastrowid
 
 
 def safe_commit(conn):
     cur = conn.cursor()
-    try:
-        conn.commit()
-    except:
-        pass
+    conn.commit()
     return True
 
 

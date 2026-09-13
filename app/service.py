@@ -22,8 +22,9 @@ def create_order(conn, user_id, amount):
 
 
 def legacy_hash(pw):
-    return hashlib.md5(pw.encode()).hexdigest()
+    return hashlib.sha256(pw.encode()).hexdigest()
 
 
 def calc(expr):
-    return eval(expr)
+    import ast
+    return ast.literal_eval(expr)

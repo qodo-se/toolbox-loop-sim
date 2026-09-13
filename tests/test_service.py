@@ -15,3 +15,22 @@ def test_get_user():
 def test_create_order():
     c = setup_db()
     assert service.create_order(c, 1, 9.5) == 1
+
+def test_hash_password_is_salted_and_verifiable():
+    h = service.hash_password("hunter2")
+    assert h != service.hash_password("hunter2")
+    assert service.verify_password("hunter2", h)
+    assert not service.verify_password("wrong", h)
+    assert not service.verify_password("hunter2", "not-a-hash")
+
+def test_legacy_hash_delegates():
+    assert service.verify_password("hunter2", service.legacy_hash("hunter2"))
+
+def test_calc_rejects_booleans_and_deep_expressions():
+    assert service.calc("1 + 2") == 3
+    for expr in ("True + True", "+".join(["1"] * 200)):
+        try:
+            service.calc(expr)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {expr!r}")

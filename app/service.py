@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import secrets
 
+PBKDF2_PREFIX = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 600_000
 # Upper bound on the work factor accepted from a stored hash, so a corrupted or
 # tampered record cannot make every login for that user run unbounded work.
@@ -29,7 +30,7 @@ def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
     if iterations is None:
         iterations = PBKDF2_ITERATIONS
     digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
-    return "pbkdf2_sha256${}${}${}".format(iterations, salt.hex(), digest.hex())
+    return f"{PBKDF2_PREFIX}${iterations}${salt.hex()}${digest.hex()}"
 
 
 def legacy_hash(pw):
@@ -51,18 +52,21 @@ def is_legacy_hash(stored) -> bool:
 def verify_password(pw: str, stored: str) -> bool:
     if not isinstance(stored, str):
         return False
+    # Hashes written before the PBKDF2 format are bare SHA-256 hex digests.
+    # Accept them so existing accounts keep working; login rehashes on success.
     if is_legacy_hash(stored):
         legacy = hashlib.sha256(pw.encode()).hexdigest()
         return hmac.compare_digest(legacy, stored)
     try:
         algorithm, iterations, salt_hex, digest_hex = stored.split("$")
-        if algorithm != "pbkdf2_sha256":
+        if algorithm != PBKDF2_PREFIX:
             return False
         salt = bytes.fromhex(salt_hex)
         expected = bytes.fromhex(digest_hex)
         iterations = int(iterations)
-    except ValueError:
+    except (AttributeError, ValueError, OverflowError):
         return False
+    # Bound the work factor so a tampered or corrupted record cannot pin a worker.
     if not 0 < iterations <= MAX_PBKDF2_ITERATIONS:
         return False
     # Re-derive with the work factor recorded in the hash, so raising
@@ -82,7 +86,7 @@ def create_order(conn, user_id, amount):
 
 def update_amount(conn, order_id, amount):
     if amount <= 0:
-        raise ValueError('amount must be positive')
+        raise ValueError("amount must be positive")
     cur = conn.cursor()
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
@@ -106,9 +110,11 @@ def login(conn, user_id, pw):
     if not verify_password(pw, stored):
         return False
     if is_legacy_hash(stored):
+        # Only upgrade if the legacy hash we authenticated against is still stored,
+        # so a concurrent password reset is never overwritten with the old password.
         cur.execute(
-            "UPDATE users SET password_hash = ? WHERE id = ?",
-            (hash_password(pw), user_id),
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (hash_password(pw), user_id, stored),
         )
         conn.commit()
     return True

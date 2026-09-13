@@ -25,10 +25,11 @@ def update_amount(conn, order_id, amount):
     cur = conn.cursor()
     if amount <= 0:
         raise ValueError('amount must be positive')
-    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
-    if cur.rowcount == 0:
+    cur.execute("SELECT 1 FROM orders WHERE id = ?", (order_id,))
+    if cur.fetchone() is None:
         conn.rollback()
         raise LookupError("order not found")
+    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
     return True
 

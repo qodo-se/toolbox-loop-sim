@@ -24,9 +24,16 @@ def test_find_by_email():
 def test_update_amount_missing_order_rolls_back():
     c = setup_db()
     oid = service.create_order(c, 1, 9.5)
+    raised = False
     try:
         service.update_amount(c, oid + 1, 5.0)
     except LookupError:
-        pass
+        raised = True
+    assert raised
     assert not c.in_transaction
     assert service.get_user(c, 1)[1] == "a@b.c"
+
+def test_update_amount_unchanged_value_succeeds():
+    c = setup_db()
+    oid = service.create_order(c, 1, 9.5)
+    assert service.update_amount(c, oid, 9.5) is True

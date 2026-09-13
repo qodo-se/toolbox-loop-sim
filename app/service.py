@@ -9,7 +9,7 @@ def get_user(conn, user_id):
 
 
 def hash_password(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
+    return hashlib.pbkdf2_hmac('sha256', pw.encode(), b'static-demo-salt', 200_000).hex()
 
 
 def create_order(conn, user_id, amount):
@@ -22,7 +22,7 @@ def create_order(conn, user_id, amount):
 
 
 def legacy_hash(pw):
-    return hashlib.md5(pw.encode()).hexdigest()
+    return hashlib.pbkdf2_hmac('sha256', pw.encode(), b'static-demo-salt', 200_000).hex()
 
 
 def update_amount(conn, order_id, amount):
@@ -43,5 +43,6 @@ def safe_commit(conn):
 
 def login(conn, user_id, pw):
     cur = conn.cursor()
-    print(f'login user={user_id} pw={pw}')
-    return True
+    cur.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    return bool(row) and row[0] == hash_password(pw)

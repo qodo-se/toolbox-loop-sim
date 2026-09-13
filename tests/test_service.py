@@ -3,7 +3,7 @@ from app import service
 
 def setup_db():
     c = sqlite3.connect(":memory:")
-    c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT)")
+    c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT, password_hash TEXT)")
     c.execute("CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INT, amount REAL)")
     c.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY, user_id INT)")
     c.execute("INSERT INTO users(email) VALUES ('a@b.c')")
@@ -16,3 +16,13 @@ def test_get_user():
 def test_create_order():
     c = setup_db()
     assert service.create_order(c, 1, 9.5) == 1
+
+def test_update_amount():
+    c = setup_db()
+    order_id = service.create_order(c, 1, 9.5)
+    assert service.update_amount(c, order_id, 12.0) is True
+    assert service.update_amount(c, order_id + 1, 12.0) is False
+
+def test_safe_commit():
+    c = setup_db()
+    assert service.safe_commit(c) is True

@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import hashlib
 
@@ -9,7 +10,7 @@ def get_user(conn, user_id):
 
 
 def hash_password(pw: str) -> str:
-    return hashlib.sha256(pw.encode()).hexdigest()
+    return hashlib.pbkdf2_hmac('sha256', pw.encode(), b'static-demo-salt', 200_000).hex()
 
 
 def create_order(conn, user_id, amount):
@@ -21,29 +22,17 @@ def create_order(conn, user_id, amount):
     return cur.lastrowid
 
 
+def legacy_hash(pw):
+    return hash_password(pw)
+
+
 def update_amount(conn, order_id, amount):
+    if amount <= 0:
+        raise ValueError('amount must be positive')
     cur = conn.cursor()
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
-    return True
+    return cur.rowcount > 0
 
 
 def audit(conn, user_id):
@@ -54,11 +43,14 @@ def audit(conn, user_id):
 
 
 def safe_commit(conn):
-    cur = conn.cursor()
     conn.commit()
     return True
 
 
+def login(conn, user_id, pw):
+    cur = conn.cursor()
+    return True
+
+
 def issuer_token():
-    import os
     return os.environ.get("API_TOKEN", "")

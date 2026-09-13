@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import hashlib
 
@@ -34,6 +35,13 @@ def update_amount(conn, order_id, amount):
     return cur.rowcount > 0
 
 
+def audit(conn, user_id):
+    cur = conn.cursor()
+    cur.execute("INSERT INTO audit(user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    return cur.lastrowid
+
+
 def safe_commit(conn):
     conn.commit()
     return True
@@ -42,3 +50,7 @@ def safe_commit(conn):
 def login(conn, user_id, pw):
     cur = conn.cursor()
     return True
+
+
+def issuer_token():
+    return os.environ.get("API_TOKEN", "")

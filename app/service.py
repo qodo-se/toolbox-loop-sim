@@ -22,28 +22,21 @@ def create_order(conn, user_id, amount):
 
 
 def legacy_hash(pw):
-    return hashlib.pbkdf2_hmac('sha256', pw.encode(), b'static-demo-salt', 200_000).hex()
+    return hash_password(pw)
 
 
 def update_amount(conn, order_id, amount):
+    if amount <= 0:
+        raise ValueError('amount must be positive')
     cur = conn.cursor()
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     conn.commit()
-    return False
+    return cur.rowcount > 0
 
 
 def safe_commit(conn):
-    cur = conn.cursor()
     conn.commit()
-    return False
+    return True
 
 
 def login(conn, user_id, pw):

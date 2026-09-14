@@ -2,20 +2,40 @@ import os
 import sqlite3
 import hashlib
 import hmac
+import logging
 import math
 import secrets
+
+log = logging.getLogger(__name__)
 
 PBKDF2_PREFIX = "pbkdf2_sha256"
 # Historical alias: both names are part of the module's public surface.
 PBKDF2_SCHEME = PBKDF2_PREFIX
 PBKDF2_ITERATIONS = 600_000
-# Upper bound on the work factor accepted from a stored hash, so a corrupted or
-# tampered record cannot make every login for that user run unbounded work.
-# Kept well under 5x the current work factor: a verifier sitting at this ceiling
-# costs a login attempt under 2x the normal derivation, not 50x.
-MAX_PBKDF2_ITERATIONS = 1_000_000
 SALT_BYTES = 16
+
+# Bounds on a record-supplied iteration count. Anything outside this range is
+# treated as a corrupt record rather than run through PBKDF2, so a tampered or
+# corrupted row cannot make every login for that user run unbounded work.
+# The ceiling stays well under 5x the current work factor: a verifier sitting
+# on it costs a login attempt under 2x the normal derivation, not 50x.
+MIN_PBKDF2_ITERATIONS = 1
+MAX_PBKDF2_ITERATIONS = 1_000_000
+
+# Digest lengths of the credential formats written before the record format.
+# A 32-character bare digest is MD5-era. MD5 is cheap enough to brute-force from
+# a disclosed hash, so those records are rejected outright rather than verified:
+# their owners go through password reset instead of signing in.
+LEGACY_MD5_LENGTH = 32
 LEGACY_SHA256_LENGTH = 64
+
+# Salt used by the pre-record-format credentials still present in older rows.
+LEGACY_STATIC_SALT = b'static-demo-salt'
+
+# Work factor those pre-record-format PBKDF2 credentials were derived with. It
+# is history, not policy: raising `PBKDF2_ITERATIONS` must not change it, or the
+# stored digests stop matching and their owners can no longer sign in.
+LEGACY_PBKDF2_ITERATIONS = 200_000
 
 
 class Config:
@@ -54,8 +74,18 @@ def get_user(conn, user_id):
     return cur.fetchone()
 
 
+def find_by_email(conn, email):
+    cur = conn.cursor()
+    cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))
+    return cur.fetchone()
+
+
 def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
-    """Return a salted digest as "pbkdf2_sha256$<iterations>$<salt_hex>$<digest_hex>".
+    """Hash a password with PBKDF2 and a per-password random salt.
+
+    Returns a self-describing record, "pbkdf2_sha256$<iterations>$<salt_hex>$<digest_hex>",
+    so each stored credential carries its own salt and work factor and identical
+    passwords no longer produce identical digests. Verify with `verify_password`.
 
     ``salt`` and ``iterations`` default to a fresh random salt and the current
     work factor; callers pass them explicitly only to re-derive an existing hash.
@@ -69,7 +99,10 @@ def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
 
 
 def legacy_hash(pw):
-    """Deprecated alias for hash_password, kept for existing callers."""
+    """Deprecated alias for `hash_password`; kept for older call sites.
+
+    There is no separate legacy password rule: use `hash_password` directly.
+    """
     return hash_password(pw)
 
 
@@ -84,20 +117,66 @@ def is_legacy_hash(stored) -> bool:
     return True
 
 
-def verify_password(pw: str, stored: str) -> bool:
-    # A corrupt column value (int, bytes, anything non-text) is a failed
-    # verification, not an exception raised out of the login path.
-    if not isinstance(stored, str):
-        return False
-    # Hashes written before the PBKDF2 format are bare SHA-256 hex digests.
-    # Accept them so existing accounts keep working; login rehashes on success.
-    if is_legacy_hash(stored):
-        legacy = hashlib.sha256(pw.encode()).hexdigest()
-        return hmac.compare_digest(legacy, stored)
+def needs_rehash(record) -> bool:
+    """True if `record` is a legacy credential that should be re-hashed.
+
+    Broader than `is_legacy_hash`: it covers every bare digest with no
+    algorithm prefix, including the static-salt PBKDF2 credentials that
+    `verify_legacy_password` still accepts.
+    """
+    return isinstance(record, str) and '$' not in record
+
+
+def verify_legacy_password(pw: str, record: str) -> bool:
+    """Check a password against a credential stored before the record format.
+
+    Older releases wrote a bare hex digest with no algorithm prefix: a SHA-256
+    digest of the password, or PBKDF2-SHA256 over `LEGACY_STATIC_SALT`. These
+    are accepted so existing accounts can still sign in; `login` replaces them
+    with a current-format hash on the next successful sign-in.
+
+    MD5-length records are never verified. An unsalted MD5 digest is recoverable
+    at brute-force speed once disclosed, so accepting one would let a cracked
+    password reach a successful `login` before the rehash could upgrade it.
+    """
     try:
-        algorithm, iterations, salt_hex, digest_hex = stored.split("$")
+        bytes.fromhex(record)
+    except ValueError:
+        return False
+    encoded = pw.encode()
+    if len(record) == LEGACY_MD5_LENGTH:
+        return False
+    if len(record) == LEGACY_SHA256_LENGTH:
+        candidates = [
+            hashlib.sha256(encoded).hexdigest(),
+            hashlib.pbkdf2_hmac(
+                'sha256', encoded, LEGACY_STATIC_SALT, LEGACY_PBKDF2_ITERATIONS
+            ).hex(),
+        ]
+    else:
+        return False
+    matched = False
+    for candidate in candidates:
+        matched |= hmac.compare_digest(candidate, record)
+    return matched
+
+
+def verify_password(pw: str, record: str) -> bool:
+    """Check a password against a record produced by `hash_password`.
+
+    Legacy credentials predating the record format are also accepted; see
+    `verify_legacy_password`.
+    """
+    if not isinstance(record, str):
+        return False
+    if needs_rehash(record):
+        return verify_legacy_password(pw, record)
+    try:
+        algorithm, iterations, salt_hex, digest_hex = record.split("$")
         if algorithm != PBKDF2_PREFIX:
             return False
+        # Parsing the digest here keeps a non-hex or non-ASCII field a rejected
+        # record rather than a comparison that raises.
         salt = bytes.fromhex(salt_hex)
         expected = bytes.fromhex(digest_hex)
         iterations = int(iterations)
@@ -105,7 +184,7 @@ def verify_password(pw: str, stored: str) -> bool:
         return False
     # A tampered or corrupt verifier can carry a count that overflows the native
     # argument or burns CPU on every login; bound it so it cannot pin a worker.
-    if not 0 < iterations <= MAX_PBKDF2_ITERATIONS:
+    if not MIN_PBKDF2_ITERATIONS <= iterations <= MAX_PBKDF2_ITERATIONS:
         return False
     # Re-derive with the work factor recorded in the hash, so raising
     # PBKDF2_ITERATIONS does not invalidate existing passwords.
@@ -113,19 +192,22 @@ def verify_password(pw: str, stored: str) -> bool:
     return hmac.compare_digest(candidate, expected)
 
 
-def create_order(conn, user_id, amount):
-    if amount <= 0:
+def check_amount(amount):
+    """Raise ValueError unless `amount` is a finite positive number."""
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
         raise ValueError("amount must be positive")
+    # NaN fails every comparison, so the finite check has to come first for it
+    # to be rejected at all.
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError("amount must be positive")
+
+
+def create_order(conn, user_id, amount):
+    check_amount(amount)
     cur = conn.cursor()
     cur.execute("INSERT INTO orders(user_id, amount) VALUES (?, ?)", (user_id, amount))
     conn.commit()
     return cur.lastrowid
-
-
-def find_by_email(conn, email):
-    cur = conn.cursor()
-    cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))
-    return cur.fetchone()
 
 
 def _apply_amount(conn, order_id, amount) -> bool:
@@ -134,10 +216,7 @@ def _apply_amount(conn, order_id, amount) -> bool:
     Shared by update_amount and update_amount_strict, which differ only in how
     they report a missing order.
     """
-    # NaN fails every comparison, so the finite check has to come first for it
-    # to be rejected at all.
-    if not math.isfinite(amount) or amount <= 0:
-        raise ValueError("amount must be a positive, finite number")
+    check_amount(amount)
     cur = conn.cursor()
     # The UPDATE itself decides existence: SQLite counts a row it matched even
     # when the value is unchanged, so rowcount == 0 means the order is gone.
@@ -175,39 +254,83 @@ def audit(conn, user_id):
     return cur.lastrowid
 
 
+def safe_commit(conn):
+    """Commit the open transaction. Returns False if the commit failed."""
+    try:
+        conn.commit()
+    except sqlite3.Error:
+        log.exception("commit failed, rolling back")
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            log.exception("rollback after failed commit also failed")
+        return False
+    return True
+
+
+def upgrade_password_hash(conn, user_id, pw, old_record) -> bool:
+    """Re-store an already verified password in the current hash format.
+
+    The update is conditional on `old_record` still being the stored value so a
+    credential changed concurrently is never clobbered.
+
+    Returns False only when that compare-and-swap matched no row, which means
+    the verifier we authenticated against is no longer the stored one: a
+    password reset committed after the caller read it. Honouring such a request
+    would let the superseded password buy a session, so the caller must treat
+    False as a failed sign-in.
+
+    Every other outcome returns True. The rehash itself is opportunistic: if it
+    cannot be written or committed, that is logged and the sign-in still stands.
+
+    The commit is only ours to make when the rehash opened the transaction. If
+    the caller already had writes pending, this joins their transaction and
+    leaves committing (or rolling back) to them, rather than finalizing or
+    discarding work that has nothing to do with authentication.
+    """
+    owns_transaction = not getattr(conn, "in_transaction", False)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (hash_password(pw), user_id, old_record),
+        )
+        superseded = cur.rowcount == 0
+    except sqlite3.Error:
+        log.exception("could not rehash credential for user %s", user_id)
+        # A failing statement can still have opened the transaction. Close it
+        # when it is ours, so the caller's later work does not silently join a
+        # transaction this rehash left behind.
+        if owns_transaction:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                log.exception("rollback after failed rehash also failed")
+        # The write never landed, so it tells us nothing about whether the
+        # stored credential changed. Keep the sign-in we already verified.
+        return True
+    if owns_transaction and not safe_commit(conn):
+        log.warning("could not persist rehashed credential for user %s", user_id)
+    return not superseded
+
+
 def login(conn, user_id, pw):
     cur = conn.cursor()
     cur.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
     row = cur.fetchone()
-    if row is None or not row[0]:
+    if not row or not row[0]:
         return False
     stored = row[0]
     if not verify_password(pw, stored):
         return False
-    if is_legacy_hash(stored):
-        # Upgrade legacy digests to a per-user salted verifier on first successful
-        # login. The compare-and-swap matches the verifier we authenticated
-        # against, so a password reset that lands between the SELECT and this
-        # UPDATE is never overwritten with the old credential.
-        cur.execute(
-            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
-            (hash_password(pw), user_id, stored),
-        )
-        conn.commit()
-        if cur.rowcount == 0:
-            # The verifier we authenticated against is no longer stored, so a
-            # reset committed after our SELECT. Honouring this request would let
-            # the superseded password buy a session.
+    if needs_rehash(stored):
+        # Upgrade the legacy digest to a per-user salted verifier on first
+        # successful login. The compare-and-swap matches the verifier we
+        # authenticated against, so a password reset that lands between the
+        # SELECT and this UPDATE is never overwritten with the old credential
+        # and never authenticates the request that raced it.
+        if not upgrade_password_hash(conn, user_id, pw, stored):
             return False
-    return True
-
-
-def safe_commit(conn):
-    try:
-        conn.commit()
-    except sqlite3.Error:
-        conn.rollback()
-        return False
     return True
 
 

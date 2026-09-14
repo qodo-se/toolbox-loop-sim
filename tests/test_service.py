@@ -101,14 +101,44 @@ def test_check_amount_rejects_huge_int_without_overflow():
     c = setup_db()
     order_id = service.create_order(c, 1, 9.5)
     for huge in (10 ** 400, -(10 ** 400)):
-        for call in (lambda a: service.create_order(c, 1, a),
-                     lambda a: service.update_amount(c, order_id, a)):
+        for name, call in (("create_order", lambda a: service.create_order(c, 1, a)),
+                           ("update_amount", lambda a: service.update_amount(c, order_id, a))):
             try:
                 call(huge)
             except ValueError:
                 continue
             except OverflowError:
                 raise AssertionError("amount check raised OverflowError for %r" % (huge,))
+            raise AssertionError("%s accepted %r" % (name, huge))
+    # The rejected writes must not have touched the stored total.
+    assert c.execute("SELECT amount FROM orders WHERE id = ?", (order_id,)).fetchone()[0] == 9.5
+    assert c.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 1
+
+
+def test_order_writes_accept_large_finite_int_amount():
+    # 10 ** 20 is finite and positive but outside SQLite's 64-bit integer range,
+    # so binding the caller's int directly used to raise OverflowError.
+    c = setup_db()
+    big = 10 ** 20
+    order_id = service.create_order(c, 1, big)
+    assert c.execute("SELECT amount FROM orders WHERE id = ?", (order_id,)).fetchone()[0] == float(big)
+    assert service.update_amount(c, order_id, big * 10) is True
+    assert c.execute("SELECT amount FROM orders WHERE id = ?", (order_id,)).fetchone()[0] == float(big * 10)
+
+
+def test_login_rejects_oversized_salt_record():
+    c = setup_db()
+    oversized = "$".join((service.HASH_PREFIX, "1", "ab" * 1_000_000, "bb"))
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (oversized,))
+    assert service.login(c, 1, "s3cret") is False
+    # Just over the bound is rejected; a real-length salt still verifies.
+    just_over = "$".join(
+        (service.HASH_PREFIX, "1", "a" * (service.MAX_SALT_HEX_CHARS + 1), "bb")
+    )
+    assert service.verify_password("s3cret", just_over) is False
+    at_bound = service.hash_password("s3cret", salt=b"\x01" * (service.MAX_SALT_HEX_CHARS // 2))
+    assert service.verify_password("s3cret", at_bound) is True
+    assert service.verify_password("wrong", at_bound) is False
 
 def test_init_schema_adds_password_hash_to_old_users_table():
     c = sqlite3.connect(":memory:")

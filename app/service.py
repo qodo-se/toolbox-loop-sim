@@ -7,6 +7,10 @@ import os
 PBKDF2_ITERATIONS = 200_000
 MAX_PBKDF2_ITERATIONS = 10_000_000
 SALT_BYTES = 16
+# Upper bound on the encoded salt accepted from a stored record. Records this
+# service writes hold SALT_BYTES * 2 hex chars; the slack covers older or
+# longer salts without letting a corrupted field size the allocation.
+MAX_SALT_HEX_CHARS = 128
 HASH_PREFIX = "pbkdf2_sha256"
 
 _dummy_record = None
@@ -45,6 +49,10 @@ def verify_password(pw: str, stored: str) -> bool:
         return False
     parts = stored.split("$")
     if len(parts) == 4 and parts[0] == HASH_PREFIX:
+        # Bound the salt field before decoding it: an oversized but valid hex
+        # salt would otherwise size both the allocation and the PBKDF2 input.
+        if not parts[2] or len(parts[2]) > MAX_SALT_HEX_CHARS:
+            return False
         try:
             iterations = int(parts[1])
             if not 1 <= iterations <= MAX_PBKDF2_ITERATIONS:
@@ -68,6 +76,12 @@ def _dummy_hash():
 
 
 def _check_amount(amount):
+    """Validate an amount and return the value to bind to the REAL column.
+
+    Returns a float rather than the caller's object: the column has REAL
+    affinity anyway, and an int outside SQLite's 64-bit range cannot be bound
+    at all, so normalising here keeps large finite totals storable.
+    """
     if isinstance(amount, bool) or not isinstance(amount, (int, float)):
         raise ValueError("amount must be a number")
     try:
@@ -77,12 +91,13 @@ def _check_amount(amount):
         raise ValueError("amount is out of range")
     if not math.isfinite(as_float):
         raise ValueError("amount must be finite")
-    if amount <= 0:
+    if as_float <= 0:
         raise ValueError("amount must be positive")
+    return as_float
 
 
 def create_order(conn, user_id, amount):
-    _check_amount(amount)
+    amount = _check_amount(amount)
     cur = conn.cursor()
     cur.execute("INSERT INTO orders(user_id, amount) VALUES (?, ?)", (user_id, amount))
     conn.commit()
@@ -97,7 +112,7 @@ def audit(conn, user_id):
 
 
 def update_amount(conn, order_id, amount):
-    _check_amount(amount)
+    amount = _check_amount(amount)
     cur = conn.cursor()
     cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
     updated = cur.rowcount > 0

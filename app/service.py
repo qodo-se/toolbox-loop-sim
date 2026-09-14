@@ -12,7 +12,13 @@ PBKDF2_ITERATIONS = 600_000
 # Lower bound on the work factor accepted from a stored hash. A record carrying a
 # weaker factor is rejected outright, so a downgraded or tampered row cannot make
 # a matching digest authenticate at a cost the attacker chose.
-PBKDF2_MIN_ITERATIONS = PBKDF2_ITERATIONS
+#
+# This floor is a fixed historical minimum, deliberately NOT derived from
+# PBKDF2_ITERATIONS. Tying the two together would mean every increase of the
+# default retroactively invalidated hashes minted at the old default, locking
+# out every account that had not logged in since. Raise this only when the
+# hashes below it have actually been migrated.
+PBKDF2_MIN_ITERATIONS = 100_000
 # Upper bound on the work factor accepted from a stored hash, so a corrupted or
 # tampered record cannot make every login for that user run unbounded work.
 MAX_PBKDF2_ITERATIONS = 1_000_000

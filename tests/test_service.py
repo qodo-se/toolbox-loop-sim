@@ -309,6 +309,27 @@ def test_verify_password_honors_stored_work_factor():
     assert service.verify_password("s3cret", stored) is True
     assert service.verify_password("wrong", stored) is False
 
+def test_work_factor_floor_is_independent_of_current_default():
+    # The floor must not be an alias of the default. If it is, every increase of
+    # PBKDF2_ITERATIONS retroactively pushes existing hashes below the minimum.
+    assert 1 < service.PBKDF2_MIN_ITERATIONS < service.PBKDF2_ITERATIONS
+    assert service.PBKDF2_ITERATIONS <= service.MAX_PBKDF2_ITERATIONS
+
+def test_hashes_from_an_older_work_factor_generation_still_authenticate():
+    # 310_000 stands in for a default this service shipped before 600_000. Every
+    # raise of the default leaves a population of hashes at the old factor; if
+    # the accepted range tracked the default, those accounts would be locked out
+    # on the next deploy even though the password is correct.
+    older = 310_000
+    stored = service.hash_password("s3cret", iterations=older)
+    assert stored.startswith(f"{service.PBKDF2_PREFIX}${older}$")
+    assert service.verify_password("s3cret", stored) is True
+    assert service.verify_password("wrong", stored) is False
+    c = setup_db()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (stored,))
+    assert service.login(c, 1, "s3cret") is True
+    assert service.login(c, 1, "wrong") is False
+
 def test_verify_password_honors_explicit_salt():
     salt = bytes(range(service.SALT_BYTES))
     assert service.hash_password("s3cret", salt=salt) == service.hash_password("s3cret", salt=salt)

@@ -411,7 +411,9 @@ def test_hash_password_rejects_salt_it_could_not_verify():
 def test_hash_password_rejects_work_factor_it_could_not_verify():
     # Same invariant for the work factor: a record verify_password would refuse
     # on its iteration bound must never be storable in the first place.
-    for bad in (0, -1, service.MAX_PBKDF2_ITERATIONS + 1):
+    # bool is in the list because True passes a bare range check as 1 but
+    # serializes as "True", which verify_password cannot parse back.
+    for bad in (0, -1, service.MAX_PBKDF2_ITERATIONS + 1, True, False):
         try:
             service.hash_password("s3cret", iterations=bad)
         except ValueError:
@@ -419,6 +421,30 @@ def test_hash_password_rejects_work_factor_it_could_not_verify():
         raise AssertionError("hash_password accepted %r iterations" % (bad,))
     at_bound = service.hash_password("s3cret", iterations=1)
     assert service.verify_password("s3cret", at_bound) is True
+
+
+def test_hash_password_never_stores_an_unverifiable_work_factor():
+    # The lockout this guards: a record that stored cleanly but whose work
+    # factor verify_password refuses, so every later login fails.
+    for bad in (True, False):
+        try:
+            record = service.hash_password("s3cret", iterations=bad)
+        except ValueError:
+            continue
+        assert service.verify_password("s3cret", record) is True, (
+            "stored %r but it cannot authenticate" % (record,)
+        )
+
+
+def test_login_survives_boolean_work_factor_at_signup():
+    # End to end: whatever hash_password lets a caller store must still log in.
+    c = setup_db()
+    try:
+        record = service.hash_password("hunter2", iterations=True)
+    except ValueError:
+        return
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (record,))
+    assert service.login(c, 1, "hunter2") is True
 
 
 def test_login_rejects_oversized_salt_record():

@@ -73,6 +73,11 @@ def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
         raise ValueError("salt must not be empty")
     if len(salt) > MAX_SALT_BYTES:
         raise ValueError("salt must be at most %d bytes" % MAX_SALT_BYTES)
+    # bool passes the range check as 0/1 but serializes as "True", which
+    # verify_password parses with int() and refuses, locking the account out of
+    # a record that stored cleanly. Reject the type before the range.
+    if isinstance(iterations, bool) or not isinstance(iterations, int):
+        raise ValueError("iterations must be an int")
     if not 1 <= iterations <= MAX_PBKDF2_ITERATIONS:
         raise ValueError("iterations must be between 1 and %d" % MAX_PBKDF2_ITERATIONS)
     digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)

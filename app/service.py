@@ -14,6 +14,8 @@ MAX_PBKDF2_ITERATIONS = 1000000
 MAX_SALT_BYTES = 64
 MAX_DIGEST_BYTES = 64
 PBKDF2_PREFIX = "pbkdf2_sha256$"
+# Legacy records are bare SHA-256 hex digests, so exactly 64 hex characters.
+LEGACY_SHA256_HEX_LENGTH = 64
 
 
 def get_user(conn, user_id):
@@ -55,9 +57,21 @@ def verify_password(stored: str, pw: str) -> bool:
         # corrupt record into a crash instead of a failed authentication.
         return hmac.compare_digest(digest, expected)
     # Accounts created before the PBKDF2 format still store a bare SHA-256
-    # digest; keep verifying those so upgrading does not lock them out.
-    legacy = hashlib.sha256(pw.encode()).hexdigest()
-    return hmac.compare_digest(legacy, stored)
+    # digest; keep verifying those so upgrading does not lock them out. A
+    # non-prefixed value that is not one of those digests is corrupt rather
+    # than legacy, and has to be rejected here: compare_digest raises
+    # TypeError on non-ASCII str, which would surface out of login as a crash
+    # instead of a failed authentication.
+    if len(stored) != LEGACY_SHA256_HEX_LENGTH:
+        return False
+    try:
+        expected = bytes.fromhex(stored)
+    except ValueError:
+        return False
+    # Compare the decoded bytes, so a field that decodes short (fromhex skips
+    # ASCII whitespace) fails the comparison on length rather than matching.
+    legacy = hashlib.sha256(pw.encode()).digest()
+    return hmac.compare_digest(legacy, expected)
 
 
 def create_order(conn, user_id, amount):

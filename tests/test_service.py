@@ -97,6 +97,24 @@ def test_verify_password_fails_closed_on_non_hex_fields():
     assert service.verify_password("pbkdf2_sha256$240000$00$0", "s3cret") is False
     assert service.verify_password("pbkdf2_sha256$240000$00", "s3cret") is False
 
+def test_verify_password_fails_closed_on_corrupt_legacy_hash():
+    # A non-prefixed stored value is only a legacy hash if it is 64 hex chars.
+    # compare_digest raises TypeError on non-ASCII str, so anything else has to
+    # be rejected rather than propagated out of login.
+    assert service.verify_password("é" * 64, "s3cret") is False
+    assert service.verify_password("z" * 64, "s3cret") is False
+    assert service.verify_password("aa", "s3cret") is False
+    assert service.verify_password("plaintext-password", "s3cret") is False
+    # fromhex skips ASCII whitespace, so a 64-char field can decode short.
+    assert service.verify_password("aa " * 16 + "aa" * 8, "s3cret") is False
+
+def test_login_survives_corrupt_legacy_hash():
+    c = setup_db()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", ("é" * 64,))
+    assert service.login(c, 1, "s3cret") is False
+    stored = c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0]
+    assert stored == "é" * 64
+
 def test_verify_password_rejects_non_string_stored():
     assert service.verify_password(None, "s3cret") is False
     assert service.verify_password(b"pbkdf2_sha256$240000$00$00", "s3cret") is False

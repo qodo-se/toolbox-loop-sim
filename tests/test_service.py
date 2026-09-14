@@ -328,9 +328,28 @@ def test_needs_rehash_flags_weak_work_factor():
     assert service.needs_rehash(current) is False
 
 def test_needs_rehash_flags_legacy_digests():
-    assert service.needs_rehash(hashlib.md5(b"pw").hexdigest()) is True
     assert service.needs_rehash(hashlib.sha256(b"pw").hexdigest()) is True
     assert service.needs_rehash("not-a-hash") is False
+    # A 32-char hex digest is not an authenticable format, so there is nothing to
+    # upgrade on login.
+    assert service.needs_rehash(hashlib.md5(b"pw").hexdigest()) is False
+
+def test_needs_rehash_flags_undersized_salt():
+    short = service.hash_password("pw", salt=b"\x01", iterations=service.PBKDF2_ITERATIONS)
+    assert short.split("$")[1] == str(service.PBKDF2_ITERATIONS)
+    # The row still authenticates, which is what makes the upgrade reachable.
+    assert service.verify_password("pw", short) is True
+    assert service.needs_rehash(short) is True
+
+def test_login_upgrades_undersized_salt():
+    c = setup_db()
+    short = service.hash_password("pw", salt=b"\x01", iterations=service.PBKDF2_ITERATIONS)
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (short,))
+    assert service.login(c, 1, "pw") is True
+    stored = c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0]
+    assert len(bytes.fromhex(stored.split("$")[2])) == service.SALT_BYTES
+    assert service.needs_rehash(stored) is False
+    assert service.login(c, 1, "pw") is True
 
 def test_login_upgrades_weak_work_factor():
     c = setup_db()
@@ -358,14 +377,42 @@ def test_login_upgrades_legacy_hash():
     assert stored.startswith("pbkdf2_sha256$")
     assert service.login(c, 1, "s3cret") is True
 
-def test_login_accepts_and_upgrades_legacy_md5_hash():
+def test_md5_digest_is_not_an_accepted_credential():
+    # An unsalted MD5 digest cannot be verified slowly, so the correct password
+    # must not authenticate against one and the row must be left untouched for a
+    # password reset rather than upgraded in place.
+    md5 = hashlib.md5(b"pw").hexdigest()
+    assert service.is_legacy_hash(md5) is False
+    assert service.verify_password("pw", md5) is False
     c = setup_db()
-    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (hashlib.md5(b"pw").hexdigest(),))
-    assert service.login(c, 1, "wrong") is False
-    assert service.login(c, 1, "pw") is True
-    stored = c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0]
-    assert stored.startswith(service.PBKDF2_PREFIX + "$")
-    assert service.login(c, 1, "pw") is True
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (md5,))
+    assert service.login(c, 1, "pw") is False
+    assert c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0] == md5
+
+def test_verify_password_rejects_oversized_digest(monkeypatch):
+    # A huge stored digest must be refused on length alone, without being decoded
+    # or derived against on every login attempt.
+    oversized = "{}$1${}${}".format(service.PBKDF2_PREFIX, "00" * 16, "ab" * 100_000)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("derivation ran on an unbounded digest")
+
+    monkeypatch.setattr(service, "_derive", fail)
+    assert service.verify_password("pw", oversized) is False
+    assert service.needs_rehash(oversized) is False
+    assert len(oversized) > service.MAX_PBKDF2_RECORD_LENGTH
+
+def test_verify_password_rejects_wrong_length_digest():
+    salt_hex = "00" * service.SALT_BYTES
+    for digest_hex in ("", "ff", "ff" * 31, "ff" * 33):
+        stored = "{}$1${}${}".format(service.PBKDF2_PREFIX, salt_hex, digest_hex)
+        assert service.verify_password("pw", stored) is False
+
+def test_login_rejects_oversized_digest():
+    c = setup_db()
+    oversized = "{}$1${}${}".format(service.PBKDF2_PREFIX, "00" * 16, "ab" * 100_000)
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (oversized,))
+    assert service.login(c, 1, "pw") is False
 
 def test_weak_factor_upgrade_does_not_clobber_concurrent_reset():
     c = setup_db()

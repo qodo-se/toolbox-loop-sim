@@ -14,8 +14,19 @@ SALT_BYTES = 16
 # Salts we write are SALT_BYTES long. Accept a margin for older or
 # longer-salted rows, but refuse a record that would size the work itself.
 MAX_SALT_BYTES = 64
-LEGACY_MD5_LENGTH = 32
 LEGACY_SHA256_LENGTH = 64
+# pbkdf2_sha256 always emits a 32-byte digest, so any other length can never
+# compare equal. Pinning it keeps a huge stored digest from being decoded.
+DIGEST_HEX_LENGTH = hashlib.sha256().digest_size * 2
+# Longest record any of the bounds above can produce. Checked before the split,
+# so an oversized row is rejected without allocating its parts.
+MAX_PBKDF2_RECORD_LENGTH = (
+    len(PBKDF2_PREFIX)
+    + len(str(MAX_PBKDF2_ITERATIONS))
+    + MAX_SALT_BYTES * 2
+    + DIGEST_HEX_LENGTH
+    + 3  # the three "$" separators
+)
 
 
 class Config:
@@ -63,10 +74,16 @@ def legacy_hash(pw):
 
 
 def is_legacy_hash(stored) -> bool:
-    """True for the bare MD5 or SHA-256 hex digests written before pbkdf2_sha256."""
+    """True for the bare SHA-256 hex digests written before pbkdf2_sha256.
+
+    A 32-character hex string is deliberately not accepted. The record carries no
+    algorithm tag, so treating one as an MD5 digest is a guess, and MD5 cannot be
+    verified slowly: a disclosed digest is cheap to crack offline whether or not a
+    later login upgrades the row. Such accounts need a password reset, not a login.
+    """
     if not isinstance(stored, str):
         return False
-    if len(stored) not in (LEGACY_MD5_LENGTH, LEGACY_SHA256_LENGTH):
+    if len(stored) != LEGACY_SHA256_LENGTH:
         return False
     try:
         bytes.fromhex(stored)
@@ -80,6 +97,10 @@ def _parse_pbkdf2(stored: str):
 
     Everything that sizes the derivation is bounded here, before any work runs.
     """
+    # Bound the whole record before splitting it, so an oversized stored value is
+    # never decomposed or decoded on a login attempt that cannot succeed anyway.
+    if len(stored) > MAX_PBKDF2_RECORD_LENGTH:
+        return None
     parts = stored.split("$")
     if len(parts) != 4:
         return None
@@ -97,6 +118,10 @@ def _parse_pbkdf2(stored: str):
     # decoding it.
     if not 0 < len(salt_hex) <= MAX_SALT_BYTES * 2:
         return None
+    # A digest of any other length cannot compare equal, so reject it instead of
+    # decoding it.
+    if len(digest_hex) != DIGEST_HEX_LENGTH:
+        return None
     try:
         salt = bytes.fromhex(salt_hex)
         digest = bytes.fromhex(digest_hex)
@@ -108,14 +133,10 @@ def _parse_pbkdf2(stored: str):
 def verify_password(pw: str, stored: str) -> bool:
     if not isinstance(stored, str):
         return False
-    # Hashes written before the PBKDF2 format are bare MD5 or SHA-256 hex
-    # digests. Accept them so existing accounts keep working; login rehashes on
-    # success.
+    # Hashes written before the PBKDF2 format are bare SHA-256 hex digests.
+    # Accept them so existing accounts keep working; login rehashes on success.
     if is_legacy_hash(stored):
-        if len(stored) == LEGACY_MD5_LENGTH:
-            candidate = hashlib.md5(pw.encode()).hexdigest()
-        else:
-            candidate = hashlib.sha256(pw.encode()).hexdigest()
+        candidate = hashlib.sha256(pw.encode()).hexdigest()
         return hmac.compare_digest(candidate, stored)
     parsed = _parse_pbkdf2(stored)
     if parsed is None:
@@ -129,9 +150,11 @@ def verify_password(pw: str, stored: str) -> bool:
 def needs_rehash(stored) -> bool:
     """True when an authenticated digest should be rewritten at current settings.
 
-    Covers the pre-PBKDF2 formats and any row whose recorded work factor is below
-    PBKDF2_ITERATIONS, since such a row authenticates against its own weaker
-    derivation until it is upgraded.
+    Covers the pre-PBKDF2 format and any row weaker than what hash_password writes
+    now, since such a row authenticates against its own weaker derivation until it
+    is upgraded. Both inputs to that derivation count: a below-target work factor,
+    and a salt shorter than SALT_BYTES, whose small space stays available for
+    cross-account precomputation for as long as the row survives.
     """
     if not isinstance(stored, str):
         return False
@@ -140,7 +163,8 @@ def needs_rehash(stored) -> bool:
     parsed = _parse_pbkdf2(stored)
     if parsed is None:
         return False
-    return parsed[2] < PBKDF2_ITERATIONS
+    salt, _digest, iterations = parsed
+    return iterations < PBKDF2_ITERATIONS or len(salt) < SALT_BYTES
 
 
 def create_order(conn, user_id, amount):

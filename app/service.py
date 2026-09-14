@@ -6,9 +6,13 @@ import secrets
 import sqlite3
 
 PBKDF2_PREFIX = "pbkdf2_sha256"
+# Historical alias: both names are part of the module's public surface.
+PBKDF2_SCHEME = PBKDF2_PREFIX
 PBKDF2_ITERATIONS = 600_000
 # Upper bound on the work factor accepted from a stored hash, so a corrupted or
 # tampered record cannot make every login for that user run unbounded work.
+# Kept well under 5x the current work factor: a verifier sitting at this ceiling
+# costs a login attempt under 2x the normal derivation, not 50x.
 MAX_PBKDF2_ITERATIONS = 1_000_000
 SALT_BYTES = 16
 # Upper bounds on the decoded salt and digest a stored record may carry. We
@@ -32,6 +36,22 @@ class Config:
 
 
 config = Config()
+
+
+def ensure_schema(conn):
+    """Create the tables and backfill columns missing from pre-existing databases."""
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT, password_hash TEXT)"
+    )
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, user_id INT, amount REAL)"
+    )
+    cur.execute("PRAGMA table_info(users)")
+    if "password_hash" not in {row[1] for row in cur.fetchall()}:
+        cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+    conn.commit()
+    return True
 
 
 def get_user(conn, user_id):
@@ -77,6 +97,9 @@ def is_legacy_hash(stored) -> bool:
 
 
 def verify_password(pw: str, stored: str) -> bool:
+    # A corrupt column value (int, bytes, anything non-text) is a failed
+    # verification, not an exception raised out of the login path. An empty
+    # string is corrupt too, and is rejected here rather than parsed.
     if not isinstance(stored, str) or not stored:
         return False
     # Hashes written before the PBKDF2 format are bare SHA-256 hex digests.
@@ -101,7 +124,8 @@ def verify_password(pw: str, stored: str) -> bool:
         rounds = int(iterations)
     except (ValueError, OverflowError):
         return False
-    # Bound the work factor so a tampered or corrupted record cannot pin a worker.
+    # A tampered or corrupt verifier can carry a count that overflows the native
+    # argument or burns CPU on every login; bound it so it cannot pin a worker.
     if not 0 < rounds <= MAX_PBKDF2_ITERATIONS:
         return False
     # Check the encoded lengths before decoding, so an oversized field is
@@ -191,15 +215,21 @@ def login(conn, user_id, pw):
         return False
     if is_legacy_hash(stored):
         # The legacy record is only upgradable while we hold the plaintext, so
-        # re-hash it here rather than leaving a bare SHA-256 digest stored.
-        # Guard on the exact hash we verified: if a password reset commits
-        # between the SELECT and this UPDATE, the row no longer matches and the
-        # migration is skipped instead of writing the old password over it.
+        # re-hash it here into a per-user salted verifier rather than leaving a
+        # bare SHA-256 digest stored. The compare-and-swap guards on the exact
+        # hash we authenticated against: if a password reset commits between the
+        # SELECT and this UPDATE, the row no longer matches and the migration is
+        # skipped instead of writing the old credential over it.
         cur.execute(
             "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
             (hash_password(pw), user_id, stored),
         )
         conn.commit()
+        if cur.rowcount == 0:
+            # The verifier we authenticated against is no longer stored, so a
+            # reset committed after our SELECT. Honouring this request would let
+            # the superseded password buy a session.
+            return False
     return True
 
 

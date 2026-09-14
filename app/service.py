@@ -19,6 +19,9 @@ MIN_PBKDF2_ITERATIONS = 1
 MAX_PBKDF2_ITERATIONS = 1_000_000
 
 # Digest lengths of the credential formats written before the record format.
+# A 32-character bare digest is MD5-era. MD5 is cheap enough to brute-force from
+# a disclosed hash, so those records are rejected outright rather than verified:
+# their owners go through password reset instead of signing in.
 LEGACY_MD5_LENGTH = 32
 LEGACY_SHA256_LENGTH = 64
 
@@ -97,8 +100,9 @@ def is_legacy_hash(stored) -> bool:
 def needs_rehash(record) -> bool:
     """True if `record` is a legacy credential that should be re-hashed.
 
-    Broader than `is_legacy_hash`: it also covers the shorter MD5-era digests,
-    which `verify_legacy_password` still accepts.
+    Broader than `is_legacy_hash`: it covers every bare digest with no
+    algorithm prefix, including the static-salt PBKDF2 credentials that
+    `verify_legacy_password` still accepts.
     """
     return isinstance(record, str) and '$' not in record
 
@@ -106,10 +110,14 @@ def needs_rehash(record) -> bool:
 def verify_legacy_password(pw: str, record: str) -> bool:
     """Check a password against a credential stored before the record format.
 
-    Older releases wrote a bare hex digest with no algorithm prefix: an MD5 or
-    SHA-256 digest of the password, or PBKDF2-SHA256 over `LEGACY_STATIC_SALT`.
-    These are accepted so existing accounts can still sign in; `login` replaces
-    them with a current-format hash on the next successful sign-in.
+    Older releases wrote a bare hex digest with no algorithm prefix: a SHA-256
+    digest of the password, or PBKDF2-SHA256 over `LEGACY_STATIC_SALT`. These
+    are accepted so existing accounts can still sign in; `login` replaces them
+    with a current-format hash on the next successful sign-in.
+
+    MD5-length records are never verified. An unsalted MD5 digest is recoverable
+    at brute-force speed once disclosed, so accepting one would let a cracked
+    password reach a successful `login` before the rehash could upgrade it.
     """
     try:
         bytes.fromhex(record)
@@ -117,8 +125,8 @@ def verify_legacy_password(pw: str, record: str) -> bool:
         return False
     encoded = pw.encode()
     if len(record) == LEGACY_MD5_LENGTH:
-        candidates = [hashlib.md5(encoded).hexdigest()]
-    elif len(record) == LEGACY_SHA256_LENGTH:
+        return False
+    if len(record) == LEGACY_SHA256_LENGTH:
         candidates = [
             hashlib.sha256(encoded).hexdigest(),
             hashlib.pbkdf2_hmac(

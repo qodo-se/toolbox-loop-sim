@@ -206,9 +206,16 @@ def test_verify_password_honors_explicit_salt():
     assert service.hash_password("s3cret", salt=salt) == service.hash_password("s3cret", salt=salt)
 
 def test_verify_password_accepts_legacy_records():
-    for record in (LEGACY_MD5, LEGACY_SHA256, LEGACY_STATIC_PBKDF2):
+    for record in (LEGACY_SHA256, LEGACY_STATIC_PBKDF2):
         assert service.verify_password("hunter2", record)
         assert not service.verify_password("wrong", record)
+
+def test_verify_password_rejects_md5_records():
+    # An unsalted MD5 digest is crackable at brute-force speed once disclosed,
+    # so the right password must not be enough to verify against one.
+    assert not service.verify_password("hunter2", LEGACY_MD5)
+    assert not service.verify_password("wrong", LEGACY_MD5)
+    assert not service.verify_legacy_password("hunter2", LEGACY_MD5)
 
 def test_legacy_hash_matches_hash_password_rules():
     assert service.verify_password("hunter2", service.legacy_hash("hunter2"))
@@ -261,7 +268,7 @@ def test_login_accepts_current_hash():
 
 def test_login_accepts_and_upgrades_legacy_hashes():
     c = setup_db()
-    for i, record in enumerate((LEGACY_MD5, LEGACY_SHA256, LEGACY_STATIC_PBKDF2)):
+    for i, record in enumerate((LEGACY_SHA256, LEGACY_STATIC_PBKDF2)):
         uid = add_user(c, f"legacy{i}@b.c", record)
         assert service.login(c, uid, "hunter2")
         upgraded = stored_hash(c, uid)
@@ -270,6 +277,14 @@ def test_login_accepts_and_upgrades_legacy_hashes():
         # The upgraded credential keeps working on later sign-ins.
         assert service.login(c, uid, "hunter2")
         assert not service.login(c, uid, "wrong")
+
+def test_login_rejects_md5_hash_and_leaves_it_stored():
+    c = setup_db()
+    uid = add_user(c, "md5@b.c", LEGACY_MD5)
+    # The correct password must not sign in, so a digest recovered by brute
+    # force cannot either. The record is left for a password reset to replace.
+    assert service.login(c, uid, "hunter2") is False
+    assert stored_hash(c, uid) == LEGACY_MD5
 
 def test_login_accepts_legacy_sha256_hash():
     c = setup_db()

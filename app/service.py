@@ -173,7 +173,11 @@ def login(conn, user_id, pw):
 
 
 def safe_commit(conn):
-    conn.commit()
+    try:
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        return False
     return True
 
 

@@ -15,7 +15,22 @@ PBKDF2_ITERATIONS = 600_000
 # costs a login attempt under 2x the normal derivation, not 50x.
 MAX_PBKDF2_ITERATIONS = 1_000_000
 SALT_BYTES = 16
+# Salts we write are SALT_BYTES long. Accept a margin for older or
+# longer-salted rows, but refuse a record that would size the work itself.
+MAX_SALT_BYTES = 64
 LEGACY_SHA256_LENGTH = 64
+# pbkdf2_sha256 always emits a 32-byte digest, so any other length can never
+# compare equal. Pinning it keeps a huge stored digest from being decoded.
+DIGEST_HEX_LENGTH = hashlib.sha256().digest_size * 2
+# Longest record any of the bounds above can produce. Checked before the split,
+# so an oversized row is rejected without allocating its parts.
+MAX_PBKDF2_RECORD_LENGTH = (
+    len(PBKDF2_PREFIX)
+    + len(str(MAX_PBKDF2_ITERATIONS))
+    + MAX_SALT_BYTES * 2
+    + DIGEST_HEX_LENGTH
+    + 3  # the three "$" separators
+)
 
 
 class Config:
@@ -54,6 +69,11 @@ def get_user(conn, user_id):
     return cur.fetchone()
 
 
+def _derive(pw: str, salt: bytes, iterations: int) -> bytes:
+    """The one place the KDF actually runs, so callers can bound it first."""
+    return hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
+
+
 def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
     """Return a salted digest as "pbkdf2_sha256$<iterations>$<salt_hex>$<digest_hex>".
 
@@ -64,7 +84,7 @@ def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
         salt = secrets.token_bytes(SALT_BYTES)
     if iterations is None:
         iterations = PBKDF2_ITERATIONS
-    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
+    digest = _derive(pw, salt, iterations)
     return f"{PBKDF2_PREFIX}${iterations}${salt.hex()}${digest.hex()}"
 
 
@@ -74,14 +94,61 @@ def legacy_hash(pw):
 
 
 def is_legacy_hash(stored) -> bool:
-    """True for the bare SHA-256 hex digests written before pbkdf2_sha256."""
-    if not isinstance(stored, str) or len(stored) != LEGACY_SHA256_LENGTH:
+    """True for the bare SHA-256 hex digests written before pbkdf2_sha256.
+
+    A 32-character hex string is deliberately not accepted. The record carries no
+    algorithm tag, so treating one as an MD5 digest is a guess, and MD5 cannot be
+    verified slowly: a disclosed digest is cheap to crack offline whether or not a
+    later login upgrades the row. Such accounts need a password reset, not a login.
+    """
+    if not isinstance(stored, str):
+        return False
+    if len(stored) != LEGACY_SHA256_LENGTH:
         return False
     try:
         bytes.fromhex(stored)
     except ValueError:
         return False
     return True
+
+
+def _parse_pbkdf2(stored: str):
+    """Split a pbkdf2_sha256 record into (salt, digest, iterations), or None.
+
+    Everything that sizes the derivation is bounded here, before any work runs.
+    """
+    # Bound the whole record before splitting it, so an oversized stored value is
+    # never decomposed or decoded on a login attempt that cannot succeed anyway.
+    if len(stored) > MAX_PBKDF2_RECORD_LENGTH:
+        return None
+    parts = stored.split("$")
+    if len(parts) != 4:
+        return None
+    algorithm, iterations, salt_hex, digest_hex = parts
+    if algorithm != PBKDF2_PREFIX:
+        return None
+    try:
+        iterations = int(iterations)
+    except (ValueError, OverflowError):
+        return None
+    # A tampered or corrupt verifier can carry a count that overflows the native
+    # argument or burns CPU on every login; bound it so it cannot pin a worker.
+    if not 0 < iterations <= MAX_PBKDF2_ITERATIONS:
+        return None
+    # The salt sizes the derivation too, so bound its encoded length before
+    # decoding it.
+    if not 0 < len(salt_hex) <= MAX_SALT_BYTES * 2:
+        return None
+    # A digest of any other length cannot compare equal, so reject it instead of
+    # decoding it.
+    if len(digest_hex) != DIGEST_HEX_LENGTH:
+        return None
+    try:
+        salt = bytes.fromhex(salt_hex)
+        digest = bytes.fromhex(digest_hex)
+    except ValueError:
+        return None
+    return salt, digest, iterations
 
 
 def verify_password(pw: str, stored: str) -> bool:
@@ -92,29 +159,41 @@ def verify_password(pw: str, stored: str) -> bool:
     # Hashes written before the PBKDF2 format are bare SHA-256 hex digests.
     # Accept them so existing accounts keep working; login rehashes on success.
     if is_legacy_hash(stored):
-        legacy = hashlib.sha256(pw.encode()).hexdigest()
-        return hmac.compare_digest(legacy, stored)
-    try:
-        algorithm, iterations, salt_hex, digest_hex = stored.split("$")
-        if algorithm != PBKDF2_PREFIX:
-            return False
-        salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(digest_hex)
-        iterations = int(iterations)
-    except (AttributeError, ValueError, OverflowError):
+        candidate = hashlib.sha256(pw.encode()).hexdigest()
+        return hmac.compare_digest(candidate, stored)
+    # Every bound on the derivation lives in _parse_pbkdf2, so no attacker-supplied
+    # value reaches the KDF unchecked.
+    parsed = _parse_pbkdf2(stored)
+    if parsed is None:
         return False
-    # A tampered or corrupt verifier can carry a count that overflows the native
-    # argument or burns CPU on every login; bound it so it cannot pin a worker.
-    if not 0 < iterations <= MAX_PBKDF2_ITERATIONS:
-        return False
+    salt, expected, iterations = parsed
     # Re-derive with the work factor recorded in the hash, so raising
     # PBKDF2_ITERATIONS does not invalidate existing passwords.
-    candidate = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
-    return hmac.compare_digest(candidate, expected)
+    return hmac.compare_digest(_derive(pw, salt, iterations), expected)
+
+
+def needs_rehash(stored) -> bool:
+    """True when an authenticated digest should be rewritten at current settings.
+
+    Covers the pre-PBKDF2 format and any row weaker than what hash_password writes
+    now, since such a row authenticates against its own weaker derivation until it
+    is upgraded. Both inputs to that derivation count: a below-target work factor,
+    and a salt shorter than SALT_BYTES, whose small space stays available for
+    cross-account precomputation for as long as the row survives.
+    """
+    if not isinstance(stored, str):
+        return False
+    if is_legacy_hash(stored):
+        return True
+    parsed = _parse_pbkdf2(stored)
+    if parsed is None:
+        return False
+    salt, _digest, iterations = parsed
+    return iterations < PBKDF2_ITERATIONS or len(salt) < SALT_BYTES
 
 
 def create_order(conn, user_id, amount):
-    if amount <= 0:
+    if not amount > 0:
         raise ValueError("amount must be positive")
     cur = conn.cursor()
     cur.execute("INSERT INTO orders(user_id, amount) VALUES (?, ?)", (user_id, amount))
@@ -184,11 +263,12 @@ def login(conn, user_id, pw):
     stored = row[0]
     if not verify_password(pw, stored):
         return False
-    if is_legacy_hash(stored):
-        # Upgrade legacy digests to a per-user salted verifier on first successful
-        # login. The compare-and-swap matches the verifier we authenticated
-        # against, so a password reset that lands between the SELECT and this
-        # UPDATE is never overwritten with the old credential.
+    if needs_rehash(stored):
+        # Upgrade legacy digests, and any row below the current work factor or
+        # salt length, to a fresh verifier on first successful login. The
+        # compare-and-swap matches the verifier we authenticated against, so a
+        # password reset that lands between the SELECT and this UPDATE is never
+        # overwritten with the old credential.
         cur.execute(
             "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
             (hash_password(pw), user_id, stored),
@@ -206,7 +286,11 @@ def safe_commit(conn):
     try:
         conn.commit()
     except sqlite3.Error:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            # A connection too broken to roll back is still a failed commit.
+            pass
         return False
     return True
 

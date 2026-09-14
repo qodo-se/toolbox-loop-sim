@@ -5,7 +5,10 @@ import secrets
 
 PBKDF2_SCHEME = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 200_000
-MAX_PBKDF2_ITERATIONS = 10_000_000
+# Headroom for raising the work factor later, not an open bound. A tampered
+# verifier sitting at this ceiling costs a login attempt 5x the normal
+# derivation, not 50x.
+MAX_PBKDF2_ITERATIONS = 5 * PBKDF2_ITERATIONS
 SALT_BYTES = 16
 
 
@@ -40,6 +43,10 @@ def hash_password(pw: str, salt: bytes = None) -> str:
 
 
 def verify_password(pw: str, stored: str) -> bool:
+    # A corrupt column value (int, bytes, anything non-text) is a failed
+    # verification, not an exception raised out of the login path.
+    if not isinstance(stored, str):
+        return False
     parts = stored.split("$")
     if len(parts) == 4 and parts[0] == PBKDF2_SCHEME:
         _, iterations, salt_hex, digest = parts
@@ -89,6 +96,11 @@ def login(conn, user_id, pw):
             (hash_password(pw), user_id, stored),
         )
         conn.commit()
+        if cur.rowcount == 0:
+            # The verifier we authenticated against is no longer stored, so a
+            # reset committed after our SELECT. Honouring this request would let
+            # the superseded password buy a session.
+            return False
     return True
 
 

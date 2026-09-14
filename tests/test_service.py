@@ -53,6 +53,24 @@ def test_verify_password_rejects_out_of_range_iteration_counts():
         stored = f"{service.PBKDF2_SCHEME}${rounds}${salt.hex()}${digest}"
         assert not service.verify_password(PASSWORD, stored)
 
+def test_verify_password_rejects_non_string_verifiers():
+    # Corrupt column values are truthy, so login's falsey check lets them through.
+    for stored in (12345, b"deadbeef", 0.5, ["x"], {"a": 1}):
+        assert service.verify_password(PASSWORD, stored) is False
+
+def test_max_iterations_is_bounded_relative_to_the_written_work_factor():
+    # The ceiling caps attacker-controllable hashing work per login attempt.
+    assert service.PBKDF2_ITERATIONS <= service.MAX_PBKDF2_ITERATIONS
+    assert service.MAX_PBKDF2_ITERATIONS <= 5 * service.PBKDF2_ITERATIONS
+
+def test_login_rejects_corrupt_non_string_password_hash():
+    c = setup_db()
+    # A BLOB survives the column's TEXT affinity (an int would be coerced to
+    # text), so this is the corrupt value that reaches verify_password as bytes.
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (memoryview(b"deadbeef"),))
+    assert c.execute("SELECT typeof(password_hash) FROM users WHERE id = 1").fetchone()[0] == "blob"
+    assert service.login(c, 1, PASSWORD) is False  # returns, rather than raising
+
 def test_login_correct_password():
     c = setup_db()
     assert service.login(c, 1, PASSWORD) is True
@@ -109,7 +127,9 @@ def test_legacy_upgrade_does_not_overwrite_a_concurrent_password_reset():
 
     service.hash_password = reset_then_hash
     try:
-        service.login(c, 1, PASSWORD)
+        # The compare-and-swap matches nothing, which proves the credential we
+        # verified was superseded mid-request. That request must not authenticate.
+        assert service.login(c, 1, PASSWORD) is False
     finally:
         service.hash_password = original_hash_password
 

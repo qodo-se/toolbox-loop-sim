@@ -33,6 +33,58 @@ def test_create_order():
     c = setup_db()
     assert service.create_order(c, 1, 9.5) == 1
 
+def test_login_accepts_correct_password():
+    c = setup_db()
+    assert service.login(c, 1, "s3cret") is True
+
+def test_login_rejects_wrong_password():
+    c = setup_db()
+    assert service.login(c, 1, "wrong") is False
+
+def test_login_rejects_unknown_user():
+    c = setup_db()
+    assert service.login(c, 999, "s3cret") is False
+
+def test_hash_password_salts_each_hash():
+    assert service.hash_password("s3cret") != service.hash_password("s3cret")
+
+def test_login_rejects_malformed_password_hash():
+    c = setup_db()
+    c.execute("INSERT INTO users(email, password_hash) VALUES ('bad@pw.c', 'deadbeef')")
+    assert service.login(c, 2, "s3cret") is False
+
+def test_verify_password_rejects_iterations_outside_work_factor_range():
+    salt = "00" * service.SALT_BYTES
+    weak = (
+        "0",
+        "-1",
+        "1",
+        str(service.PBKDF2_MIN_ITERATIONS - 1),
+        str(service.PBKDF2_MAX_ITERATIONS + 1),
+    )
+    for iterations in weak:
+        stored = f"{service.PBKDF2_ALGORITHM}${iterations}${salt}$deadbeef"
+        assert service.verify_password("s3cret", stored) is False
+
+def test_verify_password_rejects_matching_digest_below_work_factor():
+    salt = bytes(service.SALT_BYTES)
+    dk = hashlib.pbkdf2_hmac("sha256", b"s3cret", salt, 1)
+    stored = f"{service.PBKDF2_ALGORITHM}$1${salt.hex()}${dk.hex()}"
+    assert service.verify_password("s3cret", stored) is False
+
+def test_hash_password_rejects_work_factor_outside_accepted_range():
+    for iterations in (1, service.PBKDF2_MIN_ITERATIONS - 1, service.MAX_PBKDF2_ITERATIONS + 1):
+        try:
+            service.hash_password("s3cret", iterations=iterations)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for iterations={iterations}")
+
+def test_login_rejects_user_without_password_hash():
+    c = setup_db()
+    c.execute("INSERT INTO users(email) VALUES ('no@pw.c')")
+    assert service.login(c, 2, "s3cret") is False
+
 def test_hash_password_is_salted_and_not_plaintext():
     first = service.hash_password(PASSWORD)
     second = service.hash_password(PASSWORD)
@@ -360,12 +412,38 @@ def test_verify_password_rejects_malformed_hashes():
         assert service.verify_password("s3cret", stored) is False
 
 def test_verify_password_honors_stored_work_factor():
-    stored = service.hash_password("s3cret", iterations=1000)
-    assert stored.startswith("pbkdf2_sha256$1000$")
+    # A factor inside the accepted range but different from the current default,
+    # so the test proves re-derivation uses the recorded factor rather than
+    # smuggling in a work factor weaker than PBKDF2_MIN_ITERATIONS.
+    stored_iterations = service.PBKDF2_MIN_ITERATIONS + 100_000
+    assert stored_iterations <= service.MAX_PBKDF2_ITERATIONS
+    assert stored_iterations != service.PBKDF2_ITERATIONS
+    stored = service.hash_password("s3cret", iterations=stored_iterations)
+    assert stored.startswith(f"pbkdf2_sha256${stored_iterations}$")
     # Still verifies after the default work factor moves on.
-    assert service.PBKDF2_ITERATIONS != 1000
     assert service.verify_password("s3cret", stored) is True
     assert service.verify_password("wrong", stored) is False
+
+def test_work_factor_floor_is_independent_of_current_default():
+    # The floor must not be an alias of the default. If it is, every increase of
+    # PBKDF2_ITERATIONS retroactively pushes existing hashes below the minimum.
+    assert 1 < service.PBKDF2_MIN_ITERATIONS < service.PBKDF2_ITERATIONS
+    assert service.PBKDF2_ITERATIONS <= service.MAX_PBKDF2_ITERATIONS
+
+def test_hashes_from_an_older_work_factor_generation_still_authenticate():
+    # 310_000 stands in for a default this service shipped before 600_000. Every
+    # raise of the default leaves a population of hashes at the old factor; if
+    # the accepted range tracked the default, those accounts would be locked out
+    # on the next deploy even though the password is correct.
+    older = 310_000
+    stored = service.hash_password("s3cret", iterations=older)
+    assert stored.startswith(f"{service.PBKDF2_PREFIX}${older}$")
+    assert service.verify_password("s3cret", stored) is True
+    assert service.verify_password("wrong", stored) is False
+    c = setup_db()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (stored,))
+    assert service.login(c, 1, "s3cret") is True
+    assert service.login(c, 1, "wrong") is False
 
 def test_verify_password_honors_explicit_salt():
     salt = bytes(range(service.SALT_BYTES))
@@ -379,7 +457,13 @@ def test_verify_password_rejects_excessive_work_factor():
 def test_verify_password_rejects_out_of_range_iterations():
     salt_hex = "00" * 16
     digest_hex = "11" * 32
-    out_of_range = ("0", "-1", str(service.MAX_PBKDF2_ITERATIONS + 1), str(10 ** 40))
+    out_of_range = (
+        "0",
+        "-1",
+        str(service.PBKDF2_MIN_ITERATIONS - 1),
+        str(service.MAX_PBKDF2_ITERATIONS + 1),
+        str(10 ** 40),
+    )
     for iterations in out_of_range:
         stored = "{}${}${}${}".format(
             service.PBKDF2_PREFIX, iterations, salt_hex, digest_hex

@@ -6,14 +6,27 @@ import math
 import secrets
 
 PBKDF2_PREFIX = "pbkdf2_sha256"
-# Historical alias: both names are part of the module's public surface.
+# Historical aliases: all three names are part of the module's public surface,
+# and callers written against any of them resolve to the same format tag.
+PBKDF2_ALGORITHM = PBKDF2_PREFIX
 PBKDF2_SCHEME = PBKDF2_PREFIX
 PBKDF2_ITERATIONS = 600_000
+# Lower bound on the work factor accepted from a stored hash. A record carrying a
+# weaker factor is rejected outright, so a downgraded or tampered row cannot make
+# a matching digest authenticate at a cost the attacker chose.
+#
+# This floor is a fixed historical minimum, deliberately NOT derived from
+# PBKDF2_ITERATIONS. Tying the two together would mean every increase of the
+# default retroactively invalidated hashes minted at the old default, locking
+# out every account that had not logged in since. Raise this only when the
+# hashes below it have actually been migrated.
+PBKDF2_MIN_ITERATIONS = 100_000
 # Upper bound on the work factor accepted from a stored hash, so a corrupted or
 # tampered record cannot make every login for that user run unbounded work.
 # Kept well under 5x the current work factor: a verifier sitting at this ceiling
 # costs a login attempt under 2x the normal derivation, not 50x.
 MAX_PBKDF2_ITERATIONS = 1_000_000
+PBKDF2_MAX_ITERATIONS = MAX_PBKDF2_ITERATIONS
 SALT_BYTES = 16
 LEGACY_SHA256_LENGTH = 64
 
@@ -59,11 +72,18 @@ def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
 
     ``salt`` and ``iterations`` default to a fresh random salt and the current
     work factor; callers pass them explicitly only to re-derive an existing hash.
+    ``iterations`` is held to the same range verify_password accepts, so this can
+    never mint a hash that would later be rejected as out of range.
     """
     if salt is None:
         salt = secrets.token_bytes(SALT_BYTES)
     if iterations is None:
         iterations = PBKDF2_ITERATIONS
+    if not PBKDF2_MIN_ITERATIONS <= iterations <= MAX_PBKDF2_ITERATIONS:
+        raise ValueError(
+            "iterations must be between "
+            f"{PBKDF2_MIN_ITERATIONS} and {MAX_PBKDF2_ITERATIONS}"
+        )
     digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
     return f"{PBKDF2_PREFIX}${iterations}${salt.hex()}${digest.hex()}"
 
@@ -103,9 +123,11 @@ def verify_password(pw: str, stored: str) -> bool:
         iterations = int(iterations)
     except (AttributeError, ValueError, OverflowError):
         return False
-    # A tampered or corrupt verifier can carry a count that overflows the native
-    # argument or burns CPU on every login; bound it so it cannot pin a worker.
-    if not 0 < iterations <= MAX_PBKDF2_ITERATIONS:
+    # Bound the work factor at both ends: below the floor a downgraded record
+    # would authenticate too cheaply, above the cap a tampered one could overflow
+    # the native argument or burn CPU on every login and pin a worker. Either way
+    # the record is not one this service wrote.
+    if not PBKDF2_MIN_ITERATIONS <= iterations <= MAX_PBKDF2_ITERATIONS:
         return False
     # Re-derive with the work factor recorded in the hash, so raising
     # PBKDF2_ITERATIONS does not invalidate existing passwords.

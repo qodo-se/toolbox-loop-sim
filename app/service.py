@@ -8,6 +8,11 @@ PBKDF2_ITERATIONS = 240000
 # Upper bound on the iteration count accepted from a stored record, so a
 # malformed or hostile value cannot overflow the native API or stall a login.
 MAX_PBKDF2_ITERATIONS = 1000000
+# Upper bounds on the decoded salt and digest a stored record may carry. We
+# write 16 and 32 bytes; anything far past that is corrupt or hostile, and
+# decoding it unbounded lets one row dictate a login's memory and CPU.
+MAX_SALT_BYTES = 64
+MAX_DIGEST_BYTES = 64
 PBKDF2_PREFIX = "pbkdf2_sha256$"
 
 
@@ -26,7 +31,7 @@ def hash_password(pw: str) -> str:
 
 
 def verify_password(stored: str, pw: str) -> bool:
-    if not stored:
+    if not isinstance(stored, str) or not stored:
         return False
     if stored.startswith(PBKDF2_PREFIX):
         try:
@@ -34,12 +39,21 @@ def verify_password(stored: str, pw: str) -> bool:
             rounds = int(iterations)
             if not 0 < rounds <= MAX_PBKDF2_ITERATIONS:
                 return False
-            digest = hashlib.pbkdf2_hmac(
-                "sha256", pw.encode(), bytes.fromhex(salt_hex), rounds
-            )
+            # Check the encoded lengths before decoding, so an oversized field
+            # is rejected without allocating it.
+            if len(salt_hex) > 2 * MAX_SALT_BYTES:
+                return False
+            if len(digest_hex) > 2 * MAX_DIGEST_BYTES:
+                return False
+            salt = bytes.fromhex(salt_hex)
+            expected = bytes.fromhex(digest_hex)
+            digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, rounds)
         except ValueError:
             return False
-        return hmac.compare_digest(digest.hex(), digest_hex)
+        # Compare raw bytes inside the same guarded path. compare_digest raises
+        # TypeError on non-ASCII str, so comparing the hex text would turn a
+        # corrupt record into a crash instead of a failed authentication.
+        return hmac.compare_digest(digest, expected)
     # Accounts created before the PBKDF2 format still store a bare SHA-256
     # digest; keep verifying those so upgrading does not lock them out.
     legacy = hashlib.sha256(pw.encode()).hexdigest()
@@ -85,12 +99,16 @@ def login(conn, user_id, pw):
     row = cur.fetchone()
     if not row or not verify_password(row[0], pw):
         return False
-    if not row[0].startswith(PBKDF2_PREFIX):
+    stored = row[0]
+    if not stored.startswith(PBKDF2_PREFIX):
         # The legacy record is only upgradable while we hold the plaintext, so
         # re-hash it here rather than leaving a bare SHA-256 digest stored.
+        # Guard on the exact hash we verified: if a password reset commits
+        # between the SELECT and this UPDATE, the row no longer matches and the
+        # migration is skipped instead of writing the old password over it.
         cur.execute(
-            "UPDATE users SET password_hash = ? WHERE id = ?",
-            (hash_password(pw), user_id),
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (hash_password(pw), user_id, stored),
         )
         conn.commit()
     return True

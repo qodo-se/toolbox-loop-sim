@@ -11,6 +11,9 @@ SALT_BYTES = 16
 # service writes hold SALT_BYTES * 2 hex chars; the slack covers older or
 # longer salts without letting a corrupted field size the allocation.
 MAX_SALT_HEX_CHARS = 128
+# The writer's own limit, kept in step with the reader's bound so hash_password
+# can never serialize a record that verify_password would refuse to decode.
+MAX_SALT_BYTES = MAX_SALT_HEX_CHARS // 2
 HASH_PREFIX = "pbkdf2_sha256"
 
 _dummy_record = None
@@ -35,9 +38,17 @@ def get_user(conn, user_id):
 
 
 def hash_password(pw: str, salt: bytes = None, iterations: int = PBKDF2_ITERATIONS) -> str:
-    """Derive a self-describing password record with a fresh per-password salt."""
+    """Derive a self-describing password record with a fresh per-password salt.
+
+    Raises ValueError for a caller-supplied salt verify_password would reject,
+    so a record that can be stored can always authenticate.
+    """
     if salt is None:
         salt = os.urandom(SALT_BYTES)
+    if not salt:
+        raise ValueError("salt must not be empty")
+    if len(salt) > MAX_SALT_BYTES:
+        raise ValueError("salt must be at most %d bytes" % MAX_SALT_BYTES)
     digest = hashlib.pbkdf2_hmac('sha256', pw.encode(), salt, iterations).hex()
     return "{}${}${}${}".format(HASH_PREFIX, iterations, salt.hex(), digest)
 
@@ -81,6 +92,9 @@ def _check_amount(amount):
     Returns a float rather than the caller's object: the column has REAL
     affinity anyway, and an int outside SQLite's 64-bit range cannot be bound
     at all, so normalising here keeps large finite totals storable.
+
+    An int that float cannot hold exactly is rejected instead of rounded, so a
+    write never persists a total different from the one the caller passed.
     """
     if isinstance(amount, bool) or not isinstance(amount, (int, float)):
         raise ValueError("amount must be a number")
@@ -91,6 +105,10 @@ def _check_amount(amount):
         raise ValueError("amount is out of range")
     if not math.isfinite(as_float):
         raise ValueError("amount must be finite")
+    if isinstance(amount, int) and as_float != amount:
+        # e.g. 2**63 + 1 rounds down to 2**63; storing that would silently
+        # change the caller's total, so refuse the write instead.
+        raise ValueError("amount cannot be stored exactly")
     if as_float <= 0:
         raise ValueError("amount must be positive")
     return as_float

@@ -126,6 +126,40 @@ def test_order_writes_accept_large_finite_int_amount():
     assert c.execute("SELECT amount FROM orders WHERE id = ?", (order_id,)).fetchone()[0] == float(big * 10)
 
 
+def test_order_writes_reject_inexact_int_amount():
+    # 2 ** 63 + 1 is finite and positive, but float rounds it down to 2 ** 63.
+    # Both writers must refuse it rather than persist a different total.
+    c = setup_db()
+    order_id = service.create_order(c, 1, 9.5)
+    for inexact in (2 ** 63 + 1, 2 ** 53 + 1):
+        for name, call in (("create_order", lambda a: service.create_order(c, 1, a)),
+                           ("update_amount", lambda a: service.update_amount(c, order_id, a))):
+            try:
+                call(inexact)
+            except ValueError:
+                continue
+            raise AssertionError("%s accepted %r" % (name, inexact))
+    assert c.execute("SELECT amount FROM orders WHERE id = ?", (order_id,)).fetchone()[0] == 9.5
+    assert c.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 1
+    # An exactly representable large int is still accepted and round-trips.
+    exact = 2 ** 63
+    assert service.update_amount(c, order_id, exact) is True
+    assert c.execute("SELECT amount FROM orders WHERE id = ?", (order_id,)).fetchone()[0] == exact
+
+
+def test_hash_password_rejects_salt_it_could_not_verify():
+    # A salt the reader's bound would refuse must not produce a storable record.
+    for bad in (b"", b"\x01" * (service.MAX_SALT_BYTES + 1)):
+        try:
+            service.hash_password("s3cret", salt=bad)
+        except ValueError:
+            continue
+        raise AssertionError("hash_password accepted %d-byte salt" % len(bad))
+    # Every salt it does accept verifies, including one at the bound.
+    for ok in (b"\x01", b"\x01" * service.MAX_SALT_BYTES):
+        assert service.verify_password("s3cret", service.hash_password("s3cret", salt=ok)) is True
+
+
 def test_login_rejects_oversized_salt_record():
     c = setup_db()
     oversized = "$".join((service.HASH_PREFIX, "1", "ab" * 1_000_000, "bb"))

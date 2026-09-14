@@ -5,6 +5,10 @@ import secrets
 
 PBKDF2_ROUNDS = 200_000
 PBKDF2_MAX_ROUNDS = 1_000_000
+PBKDF2_SALT_BYTES = 16
+# Salts we write are PBKDF2_SALT_BYTES long. Accept a margin for older or
+# longer-salted rows, but refuse a record that would size the work itself.
+PBKDF2_MAX_SALT_BYTES = 64
 PBKDF2_PREFIX = 'pbkdf2_sha256'
 
 
@@ -20,7 +24,7 @@ def _pbkdf2(pw: str, salt: bytes, rounds: int) -> str:
 
 
 def hash_password(pw: str) -> str:
-    return _pbkdf2(pw, secrets.token_bytes(16), PBKDF2_ROUNDS)
+    return _pbkdf2(pw, secrets.token_bytes(PBKDF2_SALT_BYTES), PBKDF2_ROUNDS)
 
 
 def create_order(conn, user_id, amount):
@@ -48,10 +52,16 @@ def verify_password(stored: str, pw: str):
             # Reject a record-selected work factor before spending it.
             if not 0 < rounds <= PBKDF2_MAX_ROUNDS:
                 return False, False
+            # The salt sizes the derivation too, so bound its encoded length
+            # before decoding it.
+            if not 0 < len(salt) <= PBKDF2_MAX_SALT_BYTES * 2:
+                return False, False
             expected = _pbkdf2(pw, bytes.fromhex(salt), rounds)
         except ValueError:
             return False, False
-        return hmac.compare_digest(stored, expected), False
+        # A row below the current work factor authenticates against its own
+        # weaker derivation, so flag it for rehashing at PBKDF2_ROUNDS.
+        return hmac.compare_digest(stored, expected), rounds < PBKDF2_ROUNDS
     # Digests written before PBKDF2: unsalted MD5 (32 hex) or SHA-256 (64 hex).
     if len(stored) == 32:
         candidate = legacy_hash(pw)

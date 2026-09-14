@@ -74,6 +74,38 @@ def test_verify_password_rejects_excessive_rounds():
     c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (huge,))
     assert service.login(c, 1, "pw") is False
 
+def test_verify_password_flags_weak_work_factor():
+    weak = service._pbkdf2("pw", b"\x01" * 16, 1_000)
+    assert service.verify_password(weak, "pw") == (True, True)
+    current = service.hash_password("pw")
+    assert service.verify_password(current, "pw") == (True, False)
+
+def test_login_upgrades_weak_work_factor():
+    c = setup_db()
+    weak = service._pbkdf2("pw", b"\x01" * 16, 1_000)
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (weak,))
+    assert service.login(c, 1, "pw") is True
+    stored = c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0]
+    assert stored.split("$")[1] == str(service.PBKDF2_ROUNDS)
+    assert service.verify_password(stored, "pw") == (True, False)
+    assert service.login(c, 1, "pw") is True
+
+def test_verify_password_rejects_oversized_salt(monkeypatch):
+    oversized = f"{service.PBKDF2_PREFIX}$1${'ab' * (service.PBKDF2_MAX_SALT_BYTES + 1)}$ff"
+
+    def fail(*args, **kwargs):
+        raise AssertionError("derivation ran on an unbounded salt")
+
+    monkeypatch.setattr(service, "_pbkdf2", fail)
+    assert service.verify_password(oversized, "pw") == (False, False)
+    assert service.verify_password(f"{service.PBKDF2_PREFIX}$1$$ff", "pw") == (False, False)
+
+def test_login_rejects_oversized_salt():
+    c = setup_db()
+    oversized = f"{service.PBKDF2_PREFIX}$1${'ab' * (service.PBKDF2_MAX_SALT_BYTES + 1)}$ff"
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (oversized,))
+    assert service.login(c, 1, "pw") is False
+
 def test_login_without_password_set():
     c = setup_db()
     assert service.login(c, 1, "pw") is False

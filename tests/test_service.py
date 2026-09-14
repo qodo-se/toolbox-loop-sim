@@ -239,6 +239,31 @@ def test_legacy_upgrade_does_not_clobber_concurrent_reset():
     assert not service.login(c, 1, "pw")
     assert service.login(c, 1, "new-pw")
 
+def test_login_does_not_overwrite_concurrent_password_reset(monkeypatch):
+    c = setup_db()
+    legacy = hashlib.sha256(b"old-pw").hexdigest()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (legacy,))
+    c.commit()
+    reset_hash = service.hash_password("new-pw")
+    real_hash_password = service.hash_password
+
+    def racing_hash_password(pw):
+        # Stands in for a password reset committing between login's SELECT and
+        # its legacy-migration UPDATE.
+        c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (reset_hash,))
+        c.commit()
+        return real_hash_password(pw)
+
+    monkeypatch.setattr(service, "hash_password", racing_hash_password)
+    # The compare-and-swap matches no row, so the verifier we authenticated
+    # against is gone. The superseded password must not buy a session.
+    assert service.login(c, 1, "old-pw") is False
+    monkeypatch.undo()
+    stored = c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0]
+    assert stored == reset_hash
+    assert service.login(c, 1, "new-pw") is True
+    assert service.login(c, 1, "old-pw") is False
+
 def test_update_amount():
     c = setup_db()
     order_id = service.create_order(c, 1, 9.5)
@@ -250,6 +275,7 @@ def test_update_amount_missing_order():
     oid = service.create_order(c, 1, 9.5)
     assert service.update_amount(c, oid, 12.0) is True
     assert service.update_amount(c, oid + 100, 12.0) is False
+    assert service.update_amount(c, 999, 12.0) is False
 
 def test_update_amount_rejects_non_finite():
     c = setup_db()
@@ -318,6 +344,8 @@ def test_update_amount_missing_order_keeps_caller_writes():
 def test_safe_commit():
     c = setup_db()
     assert service.safe_commit(c) is True
+    c.close()
+    assert service.safe_commit(c) is False
 
 def test_audit():
     c = setup_db()
@@ -339,6 +367,14 @@ def test_audit_records_event():
         finally:
             verify.close()
 
+def test_login():
+    c = setup_db()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1",
+              (service.hash_password(PASSWORD),))
+    assert service.login(c, 1, PASSWORD) is True
+    assert service.login(c, 1, "wrong") is False
+    assert service.login(c, 999, PASSWORD) is False
+
 def test_hash_password_is_salted():
     first = service.hash_password("s3cret")
     second = service.hash_password("s3cret")
@@ -358,6 +394,10 @@ def test_verify_password_rejects_malformed_hash():
 def test_verify_password_rejects_malformed_hashes():
     for stored in (None, 123, b"salt$digest", "", "nodollar", "a$b$c$d", "1000$zz$ff"):
         assert service.verify_password("s3cret", stored) is False
+
+def test_verify_password_rejects_non_string_stored():
+    assert service.verify_password("s3cret", None) is False
+    assert service.verify_password("s3cret", b"pbkdf2_sha256$240000$00$00") is False
 
 def test_verify_password_honors_stored_work_factor():
     stored = service.hash_password("s3cret", iterations=1000)
@@ -379,12 +419,46 @@ def test_verify_password_rejects_excessive_work_factor():
 def test_verify_password_rejects_out_of_range_iterations():
     salt_hex = "00" * 16
     digest_hex = "11" * 32
-    out_of_range = ("0", "-1", str(service.MAX_PBKDF2_ITERATIONS + 1), str(10 ** 40))
+    out_of_range = (
+        "0",
+        "-1",
+        str(service.MAX_PBKDF2_ITERATIONS + 1),
+        str(10 ** 40),
+        str(2 ** 70),
+    )
     for iterations in out_of_range:
         stored = "{}${}${}${}".format(
             service.PBKDF2_PREFIX, iterations, salt_hex, digest_hex
         )
         assert service.verify_password("s3cret", stored) is False
+
+def test_verify_password_rejects_oversized_salt_and_digest():
+    oversized_salt = "pbkdf2_sha256$240000$%s$00" % ("aa" * (service.MAX_SALT_BYTES + 1))
+    oversized_digest = "pbkdf2_sha256$240000$00$%s" % ("aa" * (service.MAX_DIGEST_BYTES + 1))
+    assert service.verify_password("s3cret", oversized_salt) is False
+    assert service.verify_password("s3cret", oversized_digest) is False
+    # A 1 MiB salt field must be rejected on length, not decoded and hashed.
+    assert service.verify_password("s3cret",
+                                   "pbkdf2_sha256$240000$%s$00" % ("aa" * 2 ** 20)) is False
+
+def test_verify_password_fails_closed_on_non_hex_fields():
+    # compare_digest raises TypeError on non-ASCII str, so a corrupt digest has
+    # to be rejected rather than propagated out of login.
+    assert service.verify_password("s3cret", "pbkdf2_sha256$240000$00$éé") is False
+    assert service.verify_password("s3cret", "pbkdf2_sha256$240000$zz$00") is False
+    assert service.verify_password("s3cret", "pbkdf2_sha256$240000$00$0") is False
+    assert service.verify_password("s3cret", "pbkdf2_sha256$240000$00") is False
+
+def test_verify_password_fails_closed_on_corrupt_legacy_hash():
+    # A non-prefixed stored value is only a legacy hash if it is 64 hex chars.
+    # compare_digest raises TypeError on non-ASCII str, so anything else has to
+    # be rejected rather than propagated out of login.
+    assert service.verify_password("s3cret", "é" * 64) is False
+    assert service.verify_password("s3cret", "z" * 64) is False
+    assert service.verify_password("s3cret", "aa") is False
+    assert service.verify_password("s3cret", "plaintext-password") is False
+    # fromhex skips ASCII whitespace, so a 64-char field can decode short.
+    assert service.verify_password("s3cret", "aa " * 16 + "aa" * 8) is False
 
 def test_login_accepts_legacy_sha256_hash():
     c = setup_db()
@@ -393,14 +467,37 @@ def test_login_accepts_legacy_sha256_hash():
     assert service.login(c, 1, "nope") is False
     assert service.login(c, 1, "s3cret") is True
 
+def test_login_legacy_hash():
+    c = setup_db()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1",
+              (hashlib.sha256(b"s3cret").hexdigest(),))
+    assert service.login(c, 1, "s3cret") is True
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1",
+              (hashlib.sha256(b"s3cret").hexdigest(),))
+    assert service.login(c, 1, "wrong") is False
+
 def test_login_upgrades_legacy_hash():
     c = setup_db()
     legacy = hashlib.sha256("s3cret".encode()).hexdigest()
     c.execute("UPDATE users SET password_hash = ? WHERE id = 1", (legacy,))
     assert service.login(c, 1, "s3cret") is True
     stored = c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0]
+    assert stored != legacy
     assert stored.startswith("pbkdf2_sha256$")
     assert service.login(c, 1, "s3cret") is True
+
+def test_login_survives_corrupt_legacy_hash():
+    c = setup_db()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1", ("é" * 64,))
+    assert service.login(c, 1, "s3cret") is False
+    stored = c.execute("SELECT password_hash FROM users WHERE id = 1").fetchone()[0]
+    assert stored == "é" * 64
+
+def test_login_survives_corrupt_stored_hash():
+    c = setup_db()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1",
+              ("pbkdf2_sha256$240000$00$éé",))
+    assert service.login(c, 1, "s3cret") is False
 
 def test_issuer_token_requires_config():
     original = os.environ.pop("API_TOKEN", None)

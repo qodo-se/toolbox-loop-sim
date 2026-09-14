@@ -1,9 +1,9 @@
-import os
-import sqlite3
 import hashlib
 import hmac
 import math
+import os
 import secrets
+import sqlite3
 
 PBKDF2_PREFIX = "pbkdf2_sha256"
 # Historical alias: both names are part of the module's public surface.
@@ -15,6 +15,12 @@ PBKDF2_ITERATIONS = 600_000
 # costs a login attempt under 2x the normal derivation, not 50x.
 MAX_PBKDF2_ITERATIONS = 1_000_000
 SALT_BYTES = 16
+# Upper bounds on the decoded salt and digest a stored record may carry. We
+# write 16 and 32 bytes; anything far past that is corrupt or hostile, and
+# decoding it unbounded lets one row dictate a login's memory and CPU.
+MAX_SALT_BYTES = 64
+MAX_DIGEST_BYTES = 64
+# Legacy records are bare SHA-256 hex digests, so exactly 64 hex characters.
 LEGACY_SHA256_LENGTH = 64
 
 
@@ -54,6 +60,12 @@ def get_user(conn, user_id):
     return cur.fetchone()
 
 
+def find_by_email(conn, email):
+    cur = conn.cursor()
+    cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))
+    return cur.fetchone()
+
+
 def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
     """Return a salted digest as "pbkdf2_sha256$<iterations>$<salt_hex>$<digest_hex>".
 
@@ -86,30 +98,53 @@ def is_legacy_hash(stored) -> bool:
 
 def verify_password(pw: str, stored: str) -> bool:
     # A corrupt column value (int, bytes, anything non-text) is a failed
-    # verification, not an exception raised out of the login path.
-    if not isinstance(stored, str):
+    # verification, not an exception raised out of the login path. An empty
+    # string is corrupt too, and is rejected here rather than parsed.
+    if not isinstance(stored, str) or not stored:
         return False
     # Hashes written before the PBKDF2 format are bare SHA-256 hex digests.
     # Accept them so existing accounts keep working; login rehashes on success.
     if is_legacy_hash(stored):
-        legacy = hashlib.sha256(pw.encode()).hexdigest()
-        return hmac.compare_digest(legacy, stored)
+        # Compare the decoded bytes, so a field that decodes short (fromhex
+        # skips ASCII whitespace) fails the comparison on length rather than
+        # matching, and a non-ASCII field cannot reach compare_digest -- it
+        # raises TypeError on non-ASCII str, which would surface out of login
+        # as a crash instead of a failed authentication.
+        legacy = hashlib.sha256(pw.encode()).digest()
+        return hmac.compare_digest(legacy, bytes.fromhex(stored))
+    # A non-prefixed value that is not one of those digests is corrupt rather
+    # than legacy, and falls through to the PBKDF2 parse below, which rejects it.
     try:
         algorithm, iterations, salt_hex, digest_hex = stored.split("$")
-        if algorithm != PBKDF2_PREFIX:
-            return False
-        salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(digest_hex)
-        iterations = int(iterations)
-    except (AttributeError, ValueError, OverflowError):
+    except (AttributeError, ValueError):
+        return False
+    if algorithm != PBKDF2_PREFIX:
+        return False
+    try:
+        rounds = int(iterations)
+    except (ValueError, OverflowError):
         return False
     # A tampered or corrupt verifier can carry a count that overflows the native
     # argument or burns CPU on every login; bound it so it cannot pin a worker.
-    if not 0 < iterations <= MAX_PBKDF2_ITERATIONS:
+    if not 0 < rounds <= MAX_PBKDF2_ITERATIONS:
+        return False
+    # Check the encoded lengths before decoding, so an oversized field is
+    # rejected without allocating it.
+    if len(salt_hex) > 2 * MAX_SALT_BYTES:
+        return False
+    if len(digest_hex) > 2 * MAX_DIGEST_BYTES:
+        return False
+    try:
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+    except ValueError:
         return False
     # Re-derive with the work factor recorded in the hash, so raising
-    # PBKDF2_ITERATIONS does not invalidate existing passwords.
-    candidate = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
+    # PBKDF2_ITERATIONS does not invalidate existing passwords. Compare raw
+    # bytes: compare_digest raises TypeError on non-ASCII str, so comparing the
+    # hex text would turn a corrupt record into a crash instead of a failed
+    # authentication.
+    candidate = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, rounds)
     return hmac.compare_digest(candidate, expected)
 
 
@@ -120,12 +155,6 @@ def create_order(conn, user_id, amount):
     cur.execute("INSERT INTO orders(user_id, amount) VALUES (?, ?)", (user_id, amount))
     conn.commit()
     return cur.lastrowid
-
-
-def find_by_email(conn, email):
-    cur = conn.cursor()
-    cur.execute("SELECT id, email FROM users WHERE email = ?", (email,))
-    return cur.fetchone()
 
 
 def _apply_amount(conn, order_id, amount) -> bool:
@@ -185,10 +214,12 @@ def login(conn, user_id, pw):
     if not verify_password(pw, stored):
         return False
     if is_legacy_hash(stored):
-        # Upgrade legacy digests to a per-user salted verifier on first successful
-        # login. The compare-and-swap matches the verifier we authenticated
-        # against, so a password reset that lands between the SELECT and this
-        # UPDATE is never overwritten with the old credential.
+        # The legacy record is only upgradable while we hold the plaintext, so
+        # re-hash it here into a per-user salted verifier rather than leaving a
+        # bare SHA-256 digest stored. The compare-and-swap guards on the exact
+        # hash we authenticated against: if a password reset commits between the
+        # SELECT and this UPDATE, the row no longer matches and the migration is
+        # skipped instead of writing the old credential over it.
         cur.execute(
             "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
             (hash_password(pw), user_id, stored),
@@ -206,7 +237,13 @@ def safe_commit(conn):
     try:
         conn.commit()
     except sqlite3.Error:
-        conn.rollback()
+        # Drop the failed transaction so the connection is not left mid-write.
+        # A connection too broken to commit may also be too broken to roll
+        # back, and that must still report failure rather than raise.
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
         return False
     return True
 

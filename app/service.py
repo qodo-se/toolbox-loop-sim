@@ -6,11 +6,15 @@ import secrets
 import sqlite3
 
 PBKDF2_PREFIX = "pbkdf2_sha256"
-# Kept as an alias so callers written against either name keep working.
+# Historical aliases, kept so callers written against any of these names keep
+# working. All three are part of the module's public surface.
 HASH_PREFIX = PBKDF2_PREFIX
+PBKDF2_SCHEME = PBKDF2_PREFIX
 PBKDF2_ITERATIONS = 600_000
 # Upper bound on the work factor accepted from a stored hash, so a corrupted or
 # tampered record cannot make every login for that user run unbounded work.
+# Kept well under 5x the current work factor: a verifier sitting at this ceiling
+# costs a login attempt under 2x the normal derivation, not 50x.
 MAX_PBKDF2_ITERATIONS = 1_000_000
 SALT_BYTES = 16
 # Upper bound on the encoded salt accepted from a stored record. Records this
@@ -40,15 +44,26 @@ config = Config()
 
 
 def init_schema(conn):
-    """Create the tables the service needs and upgrade older ones. Idempotent."""
+    """Create the tables the service needs and backfill columns missing from
+    pre-existing databases. Idempotent; returns True once the schema is current.
+    """
     cur = conn.cursor()
-    cur.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT, password_hash TEXT)")
-    cur.execute("CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, user_id INT, amount REAL)")
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT, password_hash TEXT)"
+    )
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, user_id INT, amount REAL)"
+    )
     cur.execute("CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, user_id INT)")
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(users)")}
-    if "password_hash" not in columns:
+    cur.execute("PRAGMA table_info(users)")
+    if "password_hash" not in {row[1] for row in cur.fetchall()}:
         cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
     conn.commit()
+    return True
+
+
+# Historical alias: both names are part of the module's public surface.
+ensure_schema = init_schema
 
 
 def get_user(conn, user_id):
@@ -102,7 +117,9 @@ def is_legacy_hash(stored) -> bool:
 
 def verify_password(pw: str, stored: str) -> bool:
     """Check pw against a stored record, accepting the legacy bare SHA-256 format."""
-    # A corrupted or unexpectedly typed record must fail the check, not raise.
+    # A corrupt column value (int, bytes, anything non-text, empty, or carrying
+    # non-ASCII where only hex belongs) is a failed verification, not an
+    # exception raised out of the login path.
     if not stored or not isinstance(stored, str) or not stored.isascii():
         return False
     # Hashes written before the PBKDF2 format are bare SHA-256 hex digests.
@@ -122,7 +139,8 @@ def verify_password(pw: str, stored: str) -> bool:
         iterations = int(iterations_text)
     except ValueError:
         return False
-    # Bound the work factor so a tampered or corrupted record cannot pin a worker.
+    # A tampered or corrupt verifier can carry a count that overflows the native
+    # argument or burns CPU on every login; bound it so it cannot pin a worker.
     if not 1 <= iterations <= MAX_PBKDF2_ITERATIONS:
         return False
     try:
@@ -254,13 +272,19 @@ def login(conn, user_id, pw):
         return False
     if is_legacy_hash(stored):
         # The password checked out against a legacy record, so re-store it salted.
-        # Match on the hash we read so a password reset that landed in the meantime
-        # is not overwritten with the old credential.
+        # The compare-and-swap matches the verifier we authenticated against, so a
+        # password reset that lands between the SELECT and this UPDATE is never
+        # overwritten with the old credential.
         cur.execute(
             "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
             (hash_password(pw), user_id, stored),
         )
         conn.commit()
+        if cur.rowcount == 0:
+            # The verifier we authenticated against is no longer stored, so a
+            # reset committed after our SELECT. Honouring this request would let
+            # the superseded password buy a session.
+            return False
     return True
 
 

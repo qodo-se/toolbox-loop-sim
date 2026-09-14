@@ -9,12 +9,16 @@ import secrets
 log = logging.getLogger(__name__)
 
 PBKDF2_PREFIX = "pbkdf2_sha256"
+# Historical alias: both names are part of the module's public surface.
+PBKDF2_SCHEME = PBKDF2_PREFIX
 PBKDF2_ITERATIONS = 600_000
 SALT_BYTES = 16
 
 # Bounds on a record-supplied iteration count. Anything outside this range is
 # treated as a corrupt record rather than run through PBKDF2, so a tampered or
 # corrupted row cannot make every login for that user run unbounded work.
+# The ceiling stays well under 5x the current work factor: a verifier sitting
+# on it costs a login attempt under 2x the normal derivation, not 50x.
 MIN_PBKDF2_ITERATIONS = 1
 MAX_PBKDF2_ITERATIONS = 1_000_000
 
@@ -46,6 +50,22 @@ class Config:
 
 
 config = Config()
+
+
+def ensure_schema(conn):
+    """Create the tables and backfill columns missing from pre-existing databases."""
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT, password_hash TEXT)"
+    )
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY, user_id INT, amount REAL)"
+    )
+    cur.execute("PRAGMA table_info(users)")
+    if "password_hash" not in {row[1] for row in cur.fetchall()}:
+        cur.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+    conn.commit()
+    return True
 
 
 def get_user(conn, user_id):
@@ -162,6 +182,8 @@ def verify_password(pw: str, record: str) -> bool:
         iterations = int(iterations)
     except (AttributeError, ValueError, OverflowError):
         return False
+    # A tampered or corrupt verifier can carry a count that overflows the native
+    # argument or burns CPU on every login; bound it so it cannot pin a worker.
     if not MIN_PBKDF2_ITERATIONS <= iterations <= MAX_PBKDF2_ITERATIONS:
         return False
     # Re-derive with the work factor recorded in the hash, so raising
@@ -246,12 +268,20 @@ def safe_commit(conn):
     return True
 
 
-def upgrade_password_hash(conn, user_id, pw, old_record):
+def upgrade_password_hash(conn, user_id, pw, old_record) -> bool:
     """Re-store an already verified password in the current hash format.
 
     The update is conditional on `old_record` still being the stored value so a
-    credential changed concurrently is never clobbered. The rehash is
-    opportunistic: any failure is logged and the sign-in itself still stands.
+    credential changed concurrently is never clobbered.
+
+    Returns False only when that compare-and-swap matched no row, which means
+    the verifier we authenticated against is no longer the stored one: a
+    password reset committed after the caller read it. Honouring such a request
+    would let the superseded password buy a session, so the caller must treat
+    False as a failed sign-in.
+
+    Every other outcome returns True. The rehash itself is opportunistic: if it
+    cannot be written or committed, that is logged and the sign-in still stands.
 
     The commit is only ours to make when the rehash opened the transaction. If
     the caller already had writes pending, this joins their transaction and
@@ -265,6 +295,7 @@ def upgrade_password_hash(conn, user_id, pw, old_record):
             "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
             (hash_password(pw), user_id, old_record),
         )
+        superseded = cur.rowcount == 0
     except sqlite3.Error:
         log.exception("could not rehash credential for user %s", user_id)
         # A failing statement can still have opened the transaction. Close it
@@ -275,9 +306,12 @@ def upgrade_password_hash(conn, user_id, pw, old_record):
                 conn.rollback()
             except sqlite3.Error:
                 log.exception("rollback after failed rehash also failed")
-        return
+        # The write never landed, so it tells us nothing about whether the
+        # stored credential changed. Keep the sign-in we already verified.
+        return True
     if owns_transaction and not safe_commit(conn):
         log.warning("could not persist rehashed credential for user %s", user_id)
+    return not superseded
 
 
 def login(conn, user_id, pw):
@@ -290,7 +324,13 @@ def login(conn, user_id, pw):
     if not verify_password(pw, stored):
         return False
     if needs_rehash(stored):
-        upgrade_password_hash(conn, user_id, pw, stored)
+        # Upgrade the legacy digest to a per-user salted verifier on first
+        # successful login. The compare-and-swap matches the verifier we
+        # authenticated against, so a password reset that lands between the
+        # SELECT and this UPDATE is never overwritten with the old credential
+        # and never authenticates the request that raced it.
+        if not upgrade_password_hash(conn, user_id, pw, stored):
+            return False
     return True
 
 

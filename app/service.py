@@ -1,13 +1,38 @@
+import os
 import sqlite3
 import hashlib
 import hmac
-import os
+import math
+import secrets
 
-PBKDF2_ALGORITHM = "pbkdf2_sha256"
+PBKDF2_PREFIX = "pbkdf2_sha256"
+# Alias kept so callers written against either name resolve to the same format tag.
+PBKDF2_ALGORITHM = PBKDF2_PREFIX
 PBKDF2_ITERATIONS = 600_000
+# Lower bound on the work factor accepted from a stored hash. A record carrying a
+# weaker factor is rejected outright, so a downgraded or tampered row cannot make
+# a matching digest authenticate at a cost the attacker chose.
 PBKDF2_MIN_ITERATIONS = PBKDF2_ITERATIONS
-PBKDF2_MAX_ITERATIONS = 10_000_000
+# Upper bound on the work factor accepted from a stored hash, so a corrupted or
+# tampered record cannot make every login for that user run unbounded work.
+MAX_PBKDF2_ITERATIONS = 1_000_000
+PBKDF2_MAX_ITERATIONS = MAX_PBKDF2_ITERATIONS
 SALT_BYTES = 16
+LEGACY_SHA256_LENGTH = 64
+
+
+class Config:
+    """Typed access to runtime configuration."""
+
+    @property
+    def api_token(self) -> str:
+        token = os.environ.get("API_TOKEN")
+        if not token:
+            raise RuntimeError("API_TOKEN is not configured")
+        return token
+
+
+config = Config()
 
 
 def get_user(conn, user_id):
@@ -16,26 +41,69 @@ def get_user(conn, user_id):
     return cur.fetchone()
 
 
-def hash_password(pw: str, salt: bytes = None) -> str:
+def hash_password(pw: str, salt: bytes = None, iterations: int = None) -> str:
+    """Return a salted digest as "pbkdf2_sha256$<iterations>$<salt_hex>$<digest_hex>".
+
+    ``salt`` and ``iterations`` default to a fresh random salt and the current
+    work factor; callers pass them explicitly only to re-derive an existing hash.
+    ``iterations`` is held to the same range verify_password accepts, so this can
+    never mint a hash that would later be rejected as out of range.
+    """
     if salt is None:
-        salt = os.urandom(SALT_BYTES)
-    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, PBKDF2_ITERATIONS)
-    return f"{PBKDF2_ALGORITHM}${PBKDF2_ITERATIONS}${salt.hex()}${dk.hex()}"
+        salt = secrets.token_bytes(SALT_BYTES)
+    if iterations is None:
+        iterations = PBKDF2_ITERATIONS
+    if not PBKDF2_MIN_ITERATIONS <= iterations <= MAX_PBKDF2_ITERATIONS:
+        raise ValueError(
+            "iterations must be between "
+            f"{PBKDF2_MIN_ITERATIONS} and {MAX_PBKDF2_ITERATIONS}"
+        )
+    digest = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
+    return f"{PBKDF2_PREFIX}${iterations}${salt.hex()}${digest.hex()}"
+
+
+def legacy_hash(pw):
+    """Deprecated alias for hash_password, kept for existing callers."""
+    return hash_password(pw)
+
+
+def is_legacy_hash(stored) -> bool:
+    """True for the bare SHA-256 hex digests written before pbkdf2_sha256."""
+    if not isinstance(stored, str) or len(stored) != LEGACY_SHA256_LENGTH:
+        return False
+    try:
+        bytes.fromhex(stored)
+    except ValueError:
+        return False
+    return True
 
 
 def verify_password(pw: str, stored: str) -> bool:
+    if not isinstance(stored, str):
+        return False
+    # Hashes written before the PBKDF2 format are bare SHA-256 hex digests.
+    # Accept them so existing accounts keep working; login rehashes on success.
+    if is_legacy_hash(stored):
+        legacy = hashlib.sha256(pw.encode()).hexdigest()
+        return hmac.compare_digest(legacy, stored)
     try:
-        algorithm, iterations, salt_hex, hash_hex = stored.split("$")
+        algorithm, iterations, salt_hex, digest_hex = stored.split("$")
+        if algorithm != PBKDF2_PREFIX:
+            return False
         salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
         iterations = int(iterations)
-    except (AttributeError, ValueError):
+    except (AttributeError, ValueError, OverflowError):
         return False
-    if algorithm != PBKDF2_ALGORITHM:
+    # Bound the work factor at both ends: below the floor a downgraded record
+    # would authenticate too cheaply, above the cap a tampered one could pin a
+    # worker. Either way the record is not one this service wrote.
+    if not PBKDF2_MIN_ITERATIONS <= iterations <= MAX_PBKDF2_ITERATIONS:
         return False
-    if not PBKDF2_MIN_ITERATIONS <= iterations <= PBKDF2_MAX_ITERATIONS:
-        return False
-    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
-    return hmac.compare_digest(dk.hex(), hash_hex)
+    # Re-derive with the work factor recorded in the hash, so raising
+    # PBKDF2_ITERATIONS does not invalidate existing passwords.
+    candidate = hashlib.pbkdf2_hmac("sha256", pw.encode(), salt, iterations)
+    return hmac.compare_digest(candidate, expected)
 
 
 def create_order(conn, user_id, amount):
@@ -53,37 +121,43 @@ def find_by_email(conn, email):
     return cur.fetchone()
 
 
-def login(conn, user_id, pw):
+def _apply_amount(conn, order_id, amount) -> bool:
+    """Write ``amount`` onto the order and report whether a row matched.
+
+    Shared by update_amount and update_amount_strict, which differ only in how
+    they report a missing order.
+    """
+    # NaN fails every comparison, so the finite check has to come first for it
+    # to be rejected at all.
+    if not math.isfinite(amount) or amount <= 0:
+        raise ValueError("amount must be a positive, finite number")
     cur = conn.cursor()
-    cur.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
-    row = cur.fetchone()
-    if row is None or row[0] is None:
-        return False
-    return verify_password(pw, row[0])
+    # The UPDATE itself decides existence: SQLite counts a row it matched even
+    # when the value is unchanged, so rowcount == 0 means the order is gone.
+    # The savepoint keeps the undo scoped to this write, leaving any work the
+    # caller already had pending untouched.
+    cur.execute("SAVEPOINT update_amount")
+    try:
+        cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
+        matched = cur.rowcount > 0
+        if not matched:
+            cur.execute("ROLLBACK TO update_amount")
+    finally:
+        cur.execute("RELEASE update_amount")
+    if matched:
+        conn.commit()
+    return matched
 
 
 def update_amount(conn, order_id, amount):
-    cur = conn.cursor()
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    if amount <= 0:
-        raise ValueError('amount must be positive')
-    cur.execute("UPDATE orders SET amount = ? WHERE id = ?", (amount, order_id))
-    conn.commit()
+    """Return True when the order was updated, False when it does not exist."""
+    return _apply_amount(conn, order_id, amount)
+
+
+def update_amount_strict(conn, order_id, amount):
+    """Like update_amount, but raise LookupError when the order does not exist."""
+    if not _apply_amount(conn, order_id, amount):
+        raise LookupError("order not found")
     return True
 
 
@@ -94,11 +168,48 @@ def audit(conn, user_id):
     return cur.lastrowid
 
 
-def safe_commit(conn):
+def login(conn, user_id, pw):
     cur = conn.cursor()
-    conn.commit()
+    cur.execute("SELECT password_hash FROM users WHERE id = ?", (user_id,))
+    row = cur.fetchone()
+    if row is None or not row[0]:
+        return False
+    stored = row[0]
+    if not verify_password(pw, stored):
+        return False
+    if is_legacy_hash(stored):
+        # Only upgrade if the legacy hash we authenticated against is still stored,
+        # so a concurrent password reset is never overwritten with the old password.
+        cur.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (hash_password(pw), user_id, stored),
+        )
+        conn.commit()
     return True
 
 
-def issuer_token():
-    return os.environ.get("API_TOKEN", "")
+def safe_commit(conn):
+    try:
+        conn.commit()
+    except sqlite3.Error:
+        conn.rollback()
+        return False
+    return True
+
+
+def issuer_token() -> str:
+    return config.api_token
+
+
+MAX_EXPR_DEPTH = 50
+
+
+def calc(expr):
+    import ast, operator
+    ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
+    def ev(n, depth=0):
+        if depth > MAX_EXPR_DEPTH: raise ValueError('expression too deeply nested')
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool): return n.value
+        if isinstance(n, ast.BinOp) and type(n.op) in ops: return ops[type(n.op)](ev(n.left, depth + 1), ev(n.right, depth + 1))
+        raise ValueError('unsupported expression')
+    return ev(ast.parse(expr, mode='eval').body)

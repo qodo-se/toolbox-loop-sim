@@ -183,3 +183,17 @@ def safe_commit(conn):
 
 def issuer_token() -> str:
     return config.api_token
+
+
+MAX_EXPR_DEPTH = 50
+
+
+def calc(expr):
+    import ast, operator
+    ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv}
+    def ev(n, depth=0):
+        if depth > MAX_EXPR_DEPTH: raise ValueError('expression too deeply nested')
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)) and not isinstance(n.value, bool): return n.value
+        if isinstance(n, ast.BinOp) and type(n.op) in ops: return ops[type(n.op)](ev(n.left, depth + 1), ev(n.right, depth + 1))
+        raise ValueError('unsupported expression')
+    return ev(ast.parse(expr, mode='eval').body)

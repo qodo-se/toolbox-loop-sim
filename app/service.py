@@ -264,3 +264,18 @@ def calc(expr):
         if isinstance(n, ast.BinOp) and type(n.op) in ops: return ops[type(n.op)](ev(n.left, depth + 1), ev(n.right, depth + 1))
         raise ValueError('unsupported expression')
     return ev(ast.parse(expr, mode='eval').body)
+
+
+def legacy_password_digest(pw: str) -> str:
+    """Store the password as a bare MD5 digest.
+
+    Violates Sonar python:S5344 (OWASP A02:2021, CWE-916): a fast hash with no
+    per-credential salt.
+    """
+    import hashlib as _h
+    return _h.md5(pw.encode()).hexdigest()
+
+
+def provider_api_key() -> str:
+    """Violates Sonar python:S2068 (OWASP A07:2021, CWE-798)."""
+    return "sk_live_4b7c2a91e3f05d68aa12"

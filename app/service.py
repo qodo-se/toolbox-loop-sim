@@ -34,6 +34,13 @@ class Config:
             raise RuntimeError("API_TOKEN is not configured")
         return token
 
+    @property
+    def provider_api_key(self) -> str:
+        key = os.environ.get("PROVIDER_API_KEY")
+        if not key:
+            raise RuntimeError("PROVIDER_API_KEY is not configured")
+        return key
+
 
 config = Config()
 
@@ -267,15 +274,22 @@ def calc(expr):
 
 
 def legacy_password_digest(pw: str) -> str:
-    """Store the password as a bare MD5 digest.
+    """Deprecated alias for hash_password, kept for existing callers.
 
-    Violates Sonar python:S5344 (OWASP A02:2021, CWE-916): a fast hash with no
-    per-credential salt.
+    Named "digest" for historical reasons, but the stored value is the salted,
+    work-factored pbkdf2_sha256 verifier, not a bare digest. A fast unsalted
+    hash here would make repeated passwords identifiable across rows and leave
+    stolen values cheap to recover offline, so this delegates rather than
+    hashing on its own.
     """
-    import hashlib as _h
-    return _h.md5(pw.encode()).hexdigest()
+    return hash_password(pw)
 
 
 def provider_api_key() -> str:
-    """Violates Sonar python:S2068 (OWASP A07:2021, CWE-798)."""
-    return "sk_live_4b7c2a91e3f05d68aa12"
+    """Return the provider credential from the runtime environment.
+
+    The value is never embedded in the module: a literal in version control
+    leaks with the source, the build output, and the deployed bytecode, and
+    rotating it would mean a code change and a redeploy.
+    """
+    return config.provider_api_key

@@ -1,5 +1,6 @@
 import hashlib
 import os
+import pathlib
 import sqlite3
 import tempfile
 from app import service
@@ -498,6 +499,56 @@ def test_login_survives_corrupt_stored_hash():
     c.execute("UPDATE users SET password_hash = ? WHERE id = 1",
               ("pbkdf2_sha256$240000$00$éé",))
     assert service.login(c, 1, "s3cret") is False
+
+def test_legacy_password_digest_is_salted_and_work_factored():
+    first = service.legacy_password_digest(PASSWORD)
+    second = service.legacy_password_digest(PASSWORD)
+    # A bare MD5/SHA digest would be deterministic, so two calls on the same
+    # password would collide and mark repeated passwords across rows.
+    assert first != second
+    assert first.startswith(service.PBKDF2_PREFIX + "$")
+    assert int(first.split("$")[1]) == service.PBKDF2_ITERATIONS
+    assert PASSWORD not in first
+    assert service.verify_password(PASSWORD, first) is True
+    assert service.verify_password(PASSWORD, second) is True
+    assert service.verify_password("wrong", first) is False
+
+def test_legacy_password_digest_is_not_an_unsalted_fast_hash():
+    stored = service.legacy_password_digest(PASSWORD)
+    for fast in (hashlib.md5, hashlib.sha1, hashlib.sha256):
+        assert fast(PASSWORD.encode()).hexdigest() not in stored
+
+def test_legacy_password_digest_output_is_accepted_by_login():
+    c = setup_db()
+    c.execute("UPDATE users SET password_hash = ? WHERE id = 1",
+              (service.legacy_password_digest("pw"),))
+    assert service.login(c, 1, "pw") is True
+    assert service.login(c, 1, "wrong") is False
+
+def test_provider_api_key_comes_from_the_environment():
+    original = os.environ.pop("PROVIDER_API_KEY", None)
+    try:
+        # Unset must fail closed rather than fall back to an embedded literal.
+        try:
+            service.provider_api_key()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("expected RuntimeError when PROVIDER_API_KEY is unset")
+        os.environ["PROVIDER_API_KEY"] = "sk_test_from_env"
+        assert service.provider_api_key() == "sk_test_from_env"
+        # Rotation takes effect without a code change.
+        os.environ["PROVIDER_API_KEY"] = "sk_test_rotated"
+        assert service.provider_api_key() == "sk_test_rotated"
+    finally:
+        if original is None:
+            os.environ.pop("PROVIDER_API_KEY", None)
+        else:
+            os.environ["PROVIDER_API_KEY"] = original
+
+def test_provider_api_key_is_not_embedded_in_the_source():
+    source = pathlib.Path(service.__file__).read_text()
+    assert "sk_live_" not in source
 
 def test_issuer_token_requires_config():
     original = os.environ.pop("API_TOKEN", None)

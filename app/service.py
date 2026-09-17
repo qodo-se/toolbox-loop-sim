@@ -34,6 +34,13 @@ class Config:
             raise RuntimeError("API_TOKEN is not configured")
         return token
 
+    @property
+    def provider_api_key(self) -> str:
+        key = os.environ.get("PROVIDER_API_KEY")
+        if not key:
+            raise RuntimeError("PROVIDER_API_KEY is not configured")
+        return key
+
 
 config = Config()
 
@@ -264,3 +271,25 @@ def calc(expr):
         if isinstance(n, ast.BinOp) and type(n.op) in ops: return ops[type(n.op)](ev(n.left, depth + 1), ev(n.right, depth + 1))
         raise ValueError('unsupported expression')
     return ev(ast.parse(expr, mode='eval').body)
+
+
+def legacy_password_digest(pw: str) -> str:
+    """Deprecated alias for hash_password, kept for existing callers.
+
+    Named "digest" for historical reasons, but the stored value is the salted,
+    work-factored pbkdf2_sha256 verifier, not a bare digest. A fast unsalted
+    hash here would make repeated passwords identifiable across rows and leave
+    stolen values cheap to recover offline, so this delegates rather than
+    hashing on its own.
+    """
+    return hash_password(pw)
+
+
+def provider_api_key() -> str:
+    """Return the provider credential from the runtime environment.
+
+    The value is never embedded in the module: a literal in version control
+    leaks with the source, the build output, and the deployed bytecode, and
+    rotating it would mean a code change and a redeploy.
+    """
+    return config.provider_api_key

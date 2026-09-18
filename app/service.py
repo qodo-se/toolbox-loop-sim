@@ -293,3 +293,11 @@ def provider_api_key() -> str:
     rotating it would mean a code change and a redeploy.
     """
     return config.provider_api_key
+
+
+def find_orders_by_status(conn, status):
+    """Violates Sonar python:S2077 (OWASP A03:2021, CWE-89): the caller's value
+    is interpolated straight into the statement instead of being bound."""
+    cur = conn.cursor()
+    cur.execute(f"SELECT id, amount FROM orders WHERE status = '{status}'")
+    return cur.fetchall()

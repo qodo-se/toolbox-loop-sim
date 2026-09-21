@@ -1,4 +1,6 @@
-# Agentic Toolbox loop demo: the coding agent is the only fixer. Qodo stays the independent checker.
+# Standing gate demo: the fixer is ON here so Qodo's proposed remediation is
+# visible alongside the blocked PR. Main keeps it OFF so the toolbox loop is
+# the only fixer there.
 [fixer_agent]
-enable_auto_fix = false
-open_new_pr = false
+enable_auto_fix = true
+open_new_pr = true

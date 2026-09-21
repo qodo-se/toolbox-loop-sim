@@ -293,3 +293,22 @@ def provider_api_key() -> str:
     rotating it would mean a code change and a redeploy.
     """
     return config.provider_api_key
+
+
+# --- Standing gate demo. Each function violates one enforced rule. ---
+
+def demo_password_digest(pw: str) -> str:
+    """Return a password hash using the service's salted PBKDF2 scheme."""
+    return hash_password(pw)
+
+
+def demo_provider_key() -> str:
+    """Return the provider key from runtime configuration."""
+    return provider_api_key()
+
+
+def demo_lookup_by_owner(conn, owner):
+    """Look up an owner's orders using a bound SQL parameter."""
+    cur = conn.cursor()
+    cur.execute("SELECT id, amount FROM orders WHERE user_id = ?", (owner,))
+    return cur.fetchall()

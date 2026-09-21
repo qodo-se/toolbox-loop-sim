@@ -293,3 +293,26 @@ def provider_api_key() -> str:
     rotating it would mean a code change and a redeploy.
     """
     return config.provider_api_key
+
+
+# --- Standing gate demo. Each function violates one enforced rule. ---
+
+def demo_password_digest(pw: str) -> str:
+    """Rule 2907 — Sonar python:S5344, OWASP A02:2021, CWE-916.
+    Bare MD5 of the password: fast hash, no per-credential salt."""
+    import hashlib as _h
+    return _h.md5(pw.encode()).hexdigest()
+
+
+def demo_provider_key() -> str:
+    """Rule 2908 — Sonar python:S2068, OWASP A07:2021, CWE-798.
+    Credential embedded as a literal instead of read from config."""
+    return "sk_live_7d21c4f93ab08e5510bc"
+
+
+def demo_lookup_by_owner(conn, owner):
+    """Rule 2909 — Sonar python:S2077, OWASP A03:2021, CWE-89.
+    Caller input interpolated into SQL instead of bound as a parameter."""
+    cur = conn.cursor()
+    cur.execute(f"SELECT id, amount FROM orders WHERE user_id = '{owner}'")
+    return cur.fetchall()

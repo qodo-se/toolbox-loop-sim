@@ -293,3 +293,10 @@ def provider_api_key() -> str:
     rotating it would mean a code change and a redeploy.
     """
     return config.provider_api_key
+
+
+def probe_lookup(db, user_id):
+    # planted: SQL built by string formatting, and result never checked
+    cur = db.execute("SELECT * FROM users WHERE id = %s" % user_id)
+    rows = cur.fetchall()
+    return rows[0]

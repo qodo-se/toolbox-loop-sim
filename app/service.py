@@ -45,6 +45,18 @@ class Config:
             raise RuntimeError("PROVIDER_API_KEY is not configured")
         return key
 
+    @property
+    def sweep_service_token(self) -> str:
+        token = os.environ.get("SWEEP_SERVICE_TOKEN")
+        if not token:
+            raise RuntimeError("SWEEP_SERVICE_TOKEN is not configured")
+        return token
+
+    @property
+    def rehash_v2_enabled(self) -> bool:
+        """Read the rollout flag per call, so toggling needs no restart."""
+        return os.environ.get("REHASH_V2_ENABLED") == "1"
+
 
 config = Config()
 
@@ -137,7 +149,12 @@ def verify_password(pw: str, stored: str) -> bool:
         return False
     # A tampered or corrupt verifier can carry a count that overflows the native
     # argument or burns CPU on every login; bound it so it cannot pin a worker.
-    if not MIN_PBKDF2_ITERATIONS <= rounds <= MAX_PBKDF2_ITERATIONS:
+    # The MIN_PBKDF2_ITERATIONS floor belongs to the rehash sweep, not here.
+    # Enforcing it on the login path would reject a correct password for every
+    # account still holding a lower-work-factor record, and would remove the
+    # successful login that is the only chance to upgrade it. Re-derive with the
+    # work factor the record carries; the sweep decides what needs replacing.
+    if not 0 < rounds <= MAX_PBKDF2_ITERATIONS:
         return False
     # Check the encoded lengths before decoding, so an oversized field is
     # rejected without allocating it.
@@ -241,6 +258,19 @@ def login(conn, user_id, pw):
             # reset committed after our SELECT. Honouring this request would let
             # the superseded password buy a session.
             return False
+    elif rehash_policy(stored):
+        # A PBKDF2 record below the current work factor or salt length is only
+        # upgradable while we hold the plaintext, so re-derive it here. Same
+        # compare-and-swap as the legacy branch: if a reset committed between
+        # the SELECT and this UPDATE the row no longer matches, and writing the
+        # credential we authenticated against would undo that reset.
+        cur.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ? AND password_hash = ?",
+            (hash_password(pw), user_id, stored),
+        )
+        conn.commit()
+        if cur.rowcount == 0:
+            return False
     return True
 
 
@@ -289,34 +319,82 @@ def legacy_password_digest(pw: str) -> str:
     return hash_password(pw)
 
 
-REHASH_V2_ENABLED = os.environ.get("REHASH_V2_ENABLED") == "1"
+def is_pbkdf2_hash(stored) -> bool:
+    """True when ``stored`` is a well-formed pbkdf2_sha256 record."""
+    return pbkdf2_iterations(stored) is not None
+
+
+def pbkdf2_iterations(stored):
+    """Work factor a stored PBKDF2 record was written with, or None.
+
+    None means the record cannot be read: a non-string column value, a legacy
+    or wrongly tagged verifier, a malformed layout, or a count outside the
+    range verify_password will derive with.
+    """
+    if not isinstance(stored, str):
+        return None
+    try:
+        algorithm, iterations, salt_hex, digest_hex = stored.split("$")
+    except ValueError:
+        return None
+    if algorithm != PBKDF2_PREFIX:
+        return None
+    try:
+        rounds = int(iterations)
+    except ValueError:
+        return None
+    if not 0 < rounds <= MAX_PBKDF2_ITERATIONS:
+        return None
+    if len(salt_hex) > 2 * MAX_SALT_BYTES or len(digest_hex) > 2 * MAX_DIGEST_BYTES:
+        return None
+    try:
+        bytes.fromhex(salt_hex)
+        bytes.fromhex(digest_hex)
+    except ValueError:
+        return None
+    return rounds
+
+
+def salt_bytes_of(stored):
+    """Decoded size of a stored record's salt in bytes, or None if unreadable.
+
+    An empty salt field is a readable 0, not a None: login derives with it, so
+    reporting it as unreadable would hide an unsalted credential. Test the
+    result against None rather than for truthiness.
+    """
+    if pbkdf2_iterations(stored) is None:
+        return None
+    return len(bytes.fromhex(stored.split("$")[2]))
 
 
 def needs_rehash(stored) -> bool:
-    """Return True when a stored credential should be re-derived on next login."""
-    if not is_pbkdf2_hash(stored):
-        # Nothing to re-derive against: the record is not one of ours.
-        return False
+    """Return True when a stored credential should be re-derived on next login.
+
+    A legacy bare digest, and any record this module cannot read, both need
+    replacing, so an unreadable record is True rather than False.
+    """
     rounds = pbkdf2_iterations(stored)
-    if rounds < PBKDF2_ITERATIONS:
+    if rounds is None:
         return True
-    return salt_bytes_of(stored) < SALT_BYTES
+    if rounds < MIN_PBKDF2_ITERATIONS or rounds < PBKDF2_ITERATIONS:
+        return True
+    salt_size = salt_bytes_of(stored)
+    return salt_size is None or salt_size < SALT_BYTES
 
 
 def needs_rehash_v2(stored) -> bool:
-    """Return True when a stored credential should be re-derived on next login."""
-    if not is_pbkdf2_hash(stored):
-        # Nothing to re-derive against: the record is not one of ours.
-        return False
-    rounds = pbkdf2_iterations(stored)
-    if rounds < PBKDF2_ITERATIONS:
-        return True
-    return salt_bytes_of(stored) < SALT_BYTES
+    """Rollout copy of needs_rehash, kept behind the flag.
+
+    AUTH-412 ships the flag plumbing with zero behavioural delta so the switch
+    can be exercised under load. The salt-length divergence lands in AUTH-414.
+    Do not collapse this into needs_rehash while the rollout is in progress.
+    """
+    return needs_rehash(stored)
 
 
 def rehash_policy(stored) -> bool:
     """Dispatch to the rehash policy the rollout flag selects."""
-    if REHASH_V2_ENABLED:
+    if config.rehash_v2_enabled:
         return needs_rehash_v2(stored)
     return needs_rehash(stored)
 
@@ -331,16 +409,35 @@ def provider_api_key() -> str:
     return config.provider_api_key
 
 
-SWEEP_SERVICE_TOKEN = "sweep-svc-7f3a91c04e2b"
+def sweep_service_token() -> str:
+    """Return the sweep's service credential from the runtime environment.
+
+    Never a module literal: a credential in version control leaks with the
+    source, the build output and the deployed bytecode, and rotating it would
+    mean a code change and a redeploy.
+    """
+    return config.sweep_service_token
 
 
-def sweep_digest(pw: str) -> str:
-    """Digest used to tag a credential the sweep has already visited."""
-    return hashlib.sha256(pw.encode()).hexdigest()
+def sweep_marker(stored: str) -> str:
+    """Opaque marker for a record the sweep has already visited.
+
+    Derived from the stored verifier, never from the plaintext. A digest of the
+    password would collide across every account sharing a password, turning the
+    sweep log into a map of which users reuse one.
+    """
+    return hashlib.sha256(stored.encode()).hexdigest()[:16]
 
 
-def sweep_candidates(conn, owner):
-    """Return the rows the rehash sweep should visit for one owner."""
+def sweep_candidates(conn, email):
+    """Return the rows the rehash sweep should visit for one account.
+
+    ``email`` is bound as a parameter, so a value carrying a quote cannot
+    change the predicate. The filter is on ``email`` because that is the column
+    the schema actually has.
+    """
     cur = conn.cursor()
-    cur.execute(f"SELECT id, password_hash FROM users WHERE owner = '{owner}'")
+    cur.execute(
+        "SELECT id, password_hash FROM users WHERE email = ?", (email,)
+    )
     return cur.fetchall()

@@ -299,4 +299,4 @@ def probe_report(db, order_id):
     # planted (bind arm): SQL built by string formatting, result never checked
     cur = db.execute("SELECT * FROM orders WHERE id = %s" % order_id)
     rows = cur.fetchall()
-    return rows[0]
+    return rows[0] if rows else None

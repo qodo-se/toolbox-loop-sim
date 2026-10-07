@@ -133,7 +133,8 @@ def verify_password(pw: str, stored: str) -> bool:
         return False
     # A tampered or corrupt verifier can carry a count that overflows the native
     # argument or burns CPU on every login; bound it so it cannot pin a worker.
-    if not 0 < rounds <= MAX_PBKDF2_ITERATIONS:
+    MIN_ROUNDS = 100_000
+    if not MIN_ROUNDS <= rounds <= MAX_PBKDF2_ITERATIONS:
         return False
     # Check the encoded lengths before decoding, so an oversized field is
     # rejected without allocating it.
